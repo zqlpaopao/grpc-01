@@ -1,0 +1,34 @@
+syntax = "proto3";
+package proto;
+
+
+
+/*
+在 proto 文件夹下执行如下命令：
+
+$ protoc --go_out=plugins=grpc:. *.proto
+plugins=plugin1+plugin2：指定要加载的子插件列表
+我们定义的 proto 文件是涉及了 RPC 服务的，而默认是不会生成 RPC 代码的，因此需要给出 plugins 参数传递给 protoc-gen-go，告诉它，请支持 RPC（这里指定了 gRPC）
+
+–go_out=.：设置 Go 代码输出的目录
+该指令会加载 protoc-gen-go 插件达到生成 Go 代码的目的，生成的文件以 .pb.go 为文件后缀
+
+: （冒号）
+冒号充当分隔符的作用，后跟所需要的参数集。如果这处不涉及 RPC，命令可简化为：
+
+$ protoc --go_out=. *.proto
+
+*/
+
+
+
+
+service SayHelloService {
+  rpc SayHello(SayHelloRequest) returns (SayHelloResponse) {}
+}
+message SayHelloRequest {
+  string request = 1;
+}
+message SayHelloResponse {
+  string response = 1;
+}

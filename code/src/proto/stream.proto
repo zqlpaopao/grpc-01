@@ -1,0 +1,22 @@
+syntax = "proto3";
+package proto;
+
+service StreamService {
+  rpc Eat(PublicRequest) returns (stream PublicResponse) {} //服务端流式
+  rpc Work(stream PublicRequest) returns (PublicResponse) {}//客户端流式
+  rpc Sleep(stream PublicRequest) returns (stream PublicResponse) {}//双向流
+
+}
+
+message Item{
+  string value = 1;
+  string value2 = 2;
+}
+
+message PublicRequest{
+  Item req = 1;
+}
+
+message PublicResponse{
+    Item resp = 1;
+}

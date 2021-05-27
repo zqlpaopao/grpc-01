@@ -8,4 +8,16 @@
 
 package main
 
+import (
 
+)
+
+func main(){
+
+
+	//if err := server.RunServer(context.Background(),"8080");err != nil{
+	//	fmt.Println(err)
+	//	os.Exit(1)
+	//}
+
+}
