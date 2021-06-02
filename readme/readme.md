@@ -797,17 +797,959 @@ RecvMsg 会从流中读取完整的 gRPC 消息体，另外通过阅读源码可
 
 
 
+Server
+
+`SendMsg` 方法，该方法涉及以下过程:
+
+- 消息体（对象）序列化
+- 压缩序列化后的消息体
+- 对正在传输的消息体增加 5 个字节的 header
+- 判断压缩+序列化后的消息体总字节长度是否大于预设的 maxSendMessageSize（预设值为 `math.MaxInt32`），若超出则提示错误
+- 写入给流的数据集
 
 
 
+## 3、客户端流式
+
+### 客户端代码
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"google.golang.org/grpc"
+	pb "grpc/test/src/proto"
+	"io"
+	"log"
+)
+const (
+	PORT = "9002"
+)
+func main() {
+	conn, err := grpc.Dial(":"+PORT, grpc.WithInsecure())
+	if err != nil {
+		log.Fatalf("grpc.Dial err: %v", err)
+	}
+	defer conn.Close()
+	client := pb.NewStreamServiceClient(conn)
+
+	err = printWork(client, &pb.PublicRequest{
+		Req: &pb.Item{
+			Value:                "valueWork",
+			Value2:               "value1Work",
+
+		},
+	})
+	if err != nil {
+		log.Fatalf("printWork.err: %v", err)
+	}
+}
+
+func printWork(client pb.StreamServiceClient, r *pb.PublicRequest) error {
+	stream,err := client.Work(context.Background())
+	if err != nil{
+		return err
+	}
+
+	for i := 0 ;i < 6;i++{
+		fmt.Println(r)
+		err := stream.Send(r)
+		if err == io.EOF{
+			break
+		}
+		if err != nil{
+			return err
+		}
+	}
+
+	//注意这个header是设置不了的
+	//fmt.Println(stream.Header())
+
+	resp ,err := stream.CloseAndRecv()
+	if err != nil{
+		return err
+	}
+
+	log.Printf("resp: value1 %s, value1 %s",resp.Resp.Value,resp.Resp.Value2)
+
+	//在一元rpc中header和trailer是一起到达的，在流式中是在接受消息后到达的
+	fmt.Println(stream.Trailer())//map[cc1:[dd1]]
+	return nil
+}
+
+```
 
 
 
+### 服务端代码
+
+```go
+package main
+
+import (
+	"fmt"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
+	pb "grpc/test/src/proto"
+	"io"
+	"log"
+	"net"
+)
+type StreamService struct{}
+
+const (
+	PORT = "9002"
+)
+func main() {
+
+	//设置客户端最大接收值
+	//opt := grpc.MaxRecvMsgSize()
+
+	server := grpc.NewServer()
+	pb.RegisterStreamServiceServer(server, &StreamService{})
+	lis, err := net.Listen("tcp", ":"+PORT)
+	if err != nil {
+		log.Fatalf("net.Listen err: %v", err)
+	}
+	server.Serve(lis)
+}
+//客户端流事rpc
+func (s *StreamService) Work(stream pb.StreamService_WorkServer) error {
+
+	//设置header信息 sendHeader不可同时用，否则SendHeader会覆盖前一个
+	if err := stream.SetHeader(metadata.MD{"cc2":[]string{"dd2"}});nil != err{
+		return err
+	}
+	//设置header信息
+	//if err := stream.SendHeader(metadata.MD{"cc":[]string{"dd"}});err != nil{
+	//	return err
+	//}
 
 
 
+	//设置metadata，注意一元和流式的区别
+	stream.SetTrailer(metadata.MD{"cc1":[]string{"dd1"}})
+
+	a := stream.Context().Value("a")
+	fmt.Println(a)
+	for {
+		r ,err := stream.Recv()
+		if err == io.EOF{
+			return stream.SendAndClose(&pb.PublicResponse{
+				Resp:                &pb.Item{
+					Value:                "client-stream-server",
+					Value2:               "client-stream-server-v2",
+				} ,
+			})
+		}
+		if err != nil{
+			return err
+		}
+		log.Printf("stream.Recv value: %s,value2: %s", r.Req.Value, r.Req.Value2)
+	}
+}
+
+//服务端流式
+func (s *StreamService) Eat(r *pb.PublicRequest, stream pb.StreamService_EatServer) error {
+
+	return nil
+}
+
+func (s *StreamService) Sleep(stream pb.StreamService_SleepServer) error {
+	return nil
+}
+```
 
 
+
+### 验证
+
+```go
+-> % go run src/client/client-stream-client/main.go
+req:<value:"valueWork" value2:"value1Work" > 
+req:<value:"valueWork" value2:"value1Work" > 
+req:<value:"valueWork" value2:"value1Work" > 
+req:<value:"valueWork" value2:"value1Work" > 
+req:<value:"valueWork" value2:"value1Work" > 
+req:<value:"valueWork" value2:"value1Work" > 
+2021/06/02 13:51:54 resp: value1 client-stream-server, value1 client-stream-server-v2
+map[cc1:[dd1]]
+
+-> % go run src/server/client-stream_server/mian.go
+<nil>
+2021/06/02 13:51:54 stream.Recv value: valueWork,value2: value1Work
+2021/06/02 13:51:54 stream.Recv value: valueWork,value2: value1Work
+2021/06/02 13:51:54 stream.Recv value: valueWork,value2: value1Work
+2021/06/02 13:51:54 stream.Recv value: valueWork,value2: value1Work
+2021/06/02 13:51:54 stream.Recv value: valueWork,value2: value1Work
+2021/06/02 13:51:54 stream.Recv value: valueWork,value2: value1Work
+```
+
+
+
+### 分析
+
+客户端流式 RPC，单向流，客户端通过流式发起**多次** RPC 请求给服务端，服务端发起**一次**响应给客户端
+
+![image-20210602135900704](readme.assets/image-20210602135900704.png)
+
+1. 服务端是可以设置grpc.MaxRecvMsgSize()的接收大小的 默认是1024*1024*4= 4m大小
+还可以设置grpc.MaxSendMsgSize() 发送的大小，默认是int32，超出会报错
+2. stream.SendAndClose 当发现client的流关闭之后，需要将最终的结果响应给客户端，同时关闭在另一侧的recv
+3. stream.CloseAndRecv 就是和上面的一起使用的
+
+
+
+## 4、客户端、服务端流式
+
+### 客户端
+
+```go
+package main
+
+import (
+	"context"
+	"google.golang.org/grpc"
+	pb "grpc/test/src/proto"
+	"io"
+	"log"
+)
+const (
+	PORT = "9002"
+)
+func main() {
+	conn, err := grpc.Dial(":"+PORT, grpc.WithInsecure())
+	if err != nil {
+		log.Fatalf("grpc.Dial err: %v", err)
+	}
+	defer conn.Close()
+	client := pb.NewStreamServiceClient(conn)
+
+	err = printSleep(client, &pb.PublicRequest{
+		Req: &pb.Item{
+			Value:                "valueSleep",
+			Value2:               "value1Sleep",
+		},
+	})
+	if err != nil {
+		log.Fatalf("printSleep.err: %v", err)
+	}
+}
+
+//双向流
+func printSleep(client pb.StreamServiceClient, r *pb.PublicRequest) error {
+	stream, err := client.Sleep(context.Background())
+	if err != nil {
+		return err
+	}
+	for n := 0; n <= 6; n++ {
+		err = stream.Send(r)
+		if err != nil {
+			return err
+		}
+		resp, err := stream.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		log.Printf("resp: value1: %s, value2: %s", resp.Resp.Value, resp.Resp.Value2)
+	}
+	if err = stream.CloseSend();nil != err{
+		log.Println(err)
+	}
+	return nil
+}
+```
+
+
+
+### 服务端
+
+```go
+package main
+
+import (
+	"google.golang.org/grpc"
+	pb "grpc/test/src/proto"
+	"io"
+	"log"
+	"net"
+)
+type StreamService struct{}
+
+const (
+	PORT = "9002"
+)
+func main() {
+
+	//设置客户端最大接收值
+	//opt := grpc.MaxRecvMsgSize()
+	//grpc.MaxSendMsgSize()
+
+	server := grpc.NewServer()
+	pb.RegisterStreamServiceServer(server, &StreamService{})
+	lis, err := net.Listen("tcp", ":"+PORT)
+	if err != nil {
+		log.Fatalf("net.Listen err: %v", err)
+	}
+	server.Serve(lis)
+}
+//客户端流事rpc
+func (s *StreamService) Work(stream pb.StreamService_WorkServer) error {
+	return nil
+}
+
+//服务端流式
+func (s *StreamService) Eat(r *pb.PublicRequest, stream pb.StreamService_EatServer) error {
+
+	return nil
+}
+
+//双向流
+func (s *StreamService) Sleep(stream pb.StreamService_SleepServer) error {
+	n := 0
+	for {
+		err := stream.Send(&pb.PublicResponse{
+			Resp: &pb.Item{
+				Value:  "gPRC Stream Client: Sleep",
+				Value2: "双向stream-value2",
+			},
+		})
+		if err != nil {
+			return err
+		}
+		r, err := stream.Recv()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		n++
+		log.Printf("stream.Recv req.value: %s, pt.value2: %s", r.Req.Value, r.Req.Value2)
+	}
+
+}
+```
+
+
+
+### 验证
+
+```go
+-> % go run src/client/clientServer-stream_client/main.go
+2021/06/02 14:11:55 resp: value1: gPRC Stream Client: Sleep, value2: 双向stream-value2
+2021/06/02 14:11:55 resp: value1: gPRC Stream Client: Sleep, value2: 双向stream-value2
+2021/06/02 14:11:55 resp: value1: gPRC Stream Client: Sleep, value2: 双向stream-value2
+2021/06/02 14:11:55 resp: value1: gPRC Stream Client: Sleep, value2: 双向stream-value2
+2021/06/02 14:11:55 resp: value1: gPRC Stream Client: Sleep, value2: 双向stream-value2
+2021/06/02 14:11:55 resp: value1: gPRC Stream Client: Sleep, value2: 双向stream-value2
+2021/06/02 14:11:55 resp: value1: gPRC Stream Client: Sleep, value2: 双向stream-value2
+
+-> % go run src/server/clientServer-stream_server/main.go 
+2021/06/02 14:11:39 stream.Recv req.value: valueSleep, pt.value2: value1Sleep
+2021/06/02 14:11:39 stream.Recv req.value: valueSleep, pt.value2: value1Sleep
+2021/06/02 14:11:39 stream.Recv req.value: valueSleep, pt.value2: value1Sleep
+2021/06/02 14:11:39 stream.Recv req.value: valueSleep, pt.value2: value1Sleep
+2021/06/02 14:11:39 stream.Recv req.value: valueSleep, pt.value2: value1Sleep
+2021/06/02 14:11:39 stream.Recv req.value: valueSleep, pt.value2: value1Sleep
+2021/06/02 14:11:39 stream.Recv req.value: valueSleep, pt.value2: value1Sleep
+2021/06/02 14:11:55 stream.Recv req.value: valueSleep, pt.value2: value1Sleep
+2021/06/02 14:11:55 stream.Recv req.value: valueSleep, pt.value2: value1Sleep
+2021/06/02 14:11:55 stream.Recv req.value: valueSleep, pt.value2: value1Sleep
+2021/06/02 14:11:55 stream.Recv req.value: valueSleep, pt.value2: value1Sleep
+2021/06/02 14:11:55 stream.Recv req.value: valueSleep, pt.value2: value1Sleep
+2021/06/02 14:11:55 stream.Recv req.value: valueSleep, pt.value2: value1Sleep
+2021/06/02 14:11:55 stream.Recv req.value: valueSleep, pt.value2: value1Sleep
+```
+
+简单的介绍了几种rpc的流的使用，大家根据需求，合理使用
+
+
+
+# 6、Tls证书认证
+
+## 安装证书
+
+私钥
+
+```go
+openssl ecparam -genkey -name secp384r1 -out server.key
+```
+
+- `openssl genrsa`：生成`RSA`私钥，命令的最后一个参数，将指定生成密钥的位数，如果没有指定，默认512
+- `openssl ecparam`：生成`ECC`私钥，命令为椭圆曲线密钥参数生成及操作，本文中`ECC`曲线选择的是`secp384r1`
+
+
+
+自签名公钥
+
+```go
+openssl req -new -x509 -sha256 -key server.key -out server.pem -days 3650
+```
+
+- `openssl req`：生成自签名证书，`-new`指生成证书请求、`-sha256`指使用`sha256`加密、`-key`指定私钥文件、`-x509`指输出证书、`-days 3650`为有效期，此后则输入证书拥有者信息
+
+```go
+-> % openssl req -new -x509 -sha256 -key server.key -out server.pem -days 3650
+You are about to be asked to enter information that will be incorporated
+into your certificate request.
+What you are about to enter is what is called a Distinguished Name or a DN.
+There are quite a few fields but you can leave some blank
+For some fields there will be a default value,
+If you enter '.', the field will be left blank.
+-----
+Country Name (2 letter code) []:
+State or Province Name (full name) []:
+Locality Name (eg, city) []:
+Organization Name (eg, company) []:
+Organizational Unit Name (eg, section) []:
+Common Name (eg, fully qualified host name) []:test-grpc
+Email Address []:
+```
+
+## 客户端代码
+
+```go
+package main
+import (
+	"context"
+	"fmt"
+	"io"
+	"log"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	pb "grpc/test/src/proto"
+)
+const PORT = "9002"
+func main() {
+	c, err := credentials.NewClientTLSFromFile("/Users/zhangsan/Documents/GitHub/grpc-01/code/conf/server.pem", "test-grpc")
+	if err != nil {
+		log.Fatalf("credentials.NewClientTLSFromFile err: %v", err)
+	}
+	conn, err := grpc.Dial(":"+PORT, grpc.WithTransportCredentials(c))
+	if err != nil {
+		log.Fatalf("grpc.Dial err: %v", err)
+	}
+	defer conn.Close()
+	client := pb.NewStreamServiceClient(conn)
+	err = printWork(client, &pb.PublicRequest{
+		Req: &pb.Item{
+			Value:                "valueWork",
+			Value2:               "value1Work",
+
+		},
+	})
+	if err != nil {
+		log.Fatalf("printWork.err: %v", err)
+	}
+}
+
+func printWork(client pb.StreamServiceClient, r *pb.PublicRequest) error {
+	stream,err := client.Work(context.Background())
+	if err != nil{
+		return err
+	}
+
+	for i := 0 ;i < 6;i++{
+		fmt.Println(r)
+		err := stream.Send(r)
+		if err == io.EOF{
+			break
+		}
+		if err != nil{
+			return err
+		}
+	}
+
+	//注意这个header是设置不了的
+	//fmt.Println(stream.Header())
+
+	resp ,err := stream.CloseAndRecv()
+	if err != nil{
+		return err
+	}
+
+	log.Printf("resp: value1 %s, value1 %s",resp.Resp.Value,resp.Resp.Value2)
+
+	//在一元rpc中header和trailer是一起到达的，在流式中是在接受消息后到达的
+	fmt.Println(stream.Trailer())//map[cc1:[dd1]]
+	return nil
+}
+```
+
+
+
+## 服务端代码
+
+```go
+package main
+import (
+	"fmt"
+	"google.golang.org/grpc/metadata"
+	"io"
+	"log"
+	"net"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	pb "grpc/test/src/proto"
+)
+type StreamService struct{}
+
+const PORT = "9002"
+func main() {
+	c, err := credentials.NewServerTLSFromFile("/Users/zhangsan/Documents/GitHub/grpc-01/code/conf/server.pem", "/Users/zhangsan/Documents/GitHub/grpc-01/code/conf/server.key")
+	if err != nil {
+		log.Fatalf("credentials.NewServerTLSFromFile err: %v", err)
+	}
+	server := grpc.NewServer(grpc.Creds(c))
+	pb.RegisterStreamServiceServer(server, &StreamService{})
+	lis, err := net.Listen("tcp", ":"+PORT)
+	if err != nil {
+		log.Fatalf("net.Listen err: %v", err)
+	}
+	server.Serve(lis)
+}
+
+//客户端流rpc
+func (s *StreamService) Work(stream pb.StreamService_WorkServer) error {
+
+	//设置header信息 sendHeader不可同时用，否则SendHeader会覆盖前一个
+	if err := stream.SetHeader(metadata.MD{"cc2":[]string{"dd2"}});nil != err{
+		return err
+	}
+	//设置header信息
+	//if err := stream.SendHeader(metadata.MD{"cc":[]string{"dd"}});err != nil{
+	//	return err
+	//}
+
+
+
+	//设置metadata，注意一元和流式的区别
+	stream.SetTrailer(metadata.MD{"cc1":[]string{"dd1"}})
+
+	a := stream.Context().Value("a")
+	fmt.Println(a)
+	for {
+		r ,err := stream.Recv()
+		if err == io.EOF{
+			return stream.SendAndClose(&pb.PublicResponse{
+				Resp:                &pb.Item{
+					Value:                "client-stream-server",
+					Value2:               "client-stream-server-v2",
+				} ,
+			})
+		}
+		if err != nil{
+			return err
+		}
+		log.Printf("stream.Recv value: %s,value2: %s", r.Req.Value, r.Req.Value2)
+	}
+}
+
+//服务端流式
+func (s *StreamService) Eat(r *pb.PublicRequest, stream pb.StreamService_EatServer) error {
+
+	return nil
+}
+
+func (s *StreamService) Sleep(stream pb.StreamService_SleepServer) error {
+	return nil
+}
+```
+
+
+
+```go
+go run src/server/tls-server/main.go
+<nil>
+2021/06/02 16:06:49 stream.Recv value: valueWork,value2: value1Work
+2021/06/02 16:06:49 stream.Recv value: valueWork,value2: value1Work
+2021/06/02 16:06:49 stream.Recv value: valueWork,value2: value1Work
+2021/06/02 16:06:49 stream.Recv value: valueWork,value2: value1Work
+2021/06/02 16:06:49 stream.Recv value: valueWork,value2: value1Work
+2021/06/02 16:06:49 stream.Recv value: valueWork,value2: value1Work
+
+
+-> % go run src/client/tls-client/main.go
+req:<value:"valueWork" value2:"value1Work" > 
+req:<value:"valueWork" value2:"value1Work" > 
+req:<value:"valueWork" value2:"value1Work" > 
+req:<value:"valueWork" value2:"value1Work" > 
+req:<value:"valueWork" value2:"value1Work" > 
+req:<value:"valueWork" value2:"value1Work" > 
+2021/06/02 16:08:24 resp: value1 client-stream-server, value1 client-stream-server-v2
+map[cc1:[dd1]]
+```
+
+
+
+# 7、基于CA的TLS认证
+
+## 证书的生成CA
+
+为了保证证书的可靠性和有效性，在这里可引入 CA 颁发的根证书的概念。其遵守 X.509 标准
+
+### 根证书
+
+根证书（root certificate）是属于根证书颁发机构（CA）的公钥证书。我们可以通过验证 CA 的签名从而信任 CA ，任何人都可以得到 CA 的证书（含公钥），用以验证它所签发的证书（客户端、服务端）
+
+它包含的文件如下：
+
+- 公钥
+- 密钥
+
+### 生成 Key
+
+```
+openssl genrsa -out ca.key 2048
+```
+
+### 生成密钥
+
+```
+openssl req -new -x509 -days 7200 -key ca.key -out ca.pem
+```
+
+#### 填写信息
+
+```
+You are about to be asked to enter information that will be incorporated
+into your certificate request.
+What you are about to enter is what is called a Distinguished Name or a DN.
+There are quite a few fields but you can leave some blank
+For some fields there will be a default value,
+If you enter '.', the field will be left blank.
+-----
+Country Name (2 letter code) []:
+State or Province Name (full name) []:
+Locality Name (eg, city) []:
+Organization Name (eg, company) []:
+Organizational Unit Name (eg, section) []:
+Common Name (eg, fully qualified host name) []:test-grpc
+Email Address []:
+```
+
+### Server
+
+#### 生成 CSR
+
+```
+openssl req -new -key server.key -out server.csr
+```
+
+##### 填写信息
+
+```
+You are about to be asked to enter information that will be incorporated
+into your certificate request.
+What you are about to enter is what is called a Distinguished Name or a DN.
+There are quite a few fields but you can leave some blank
+For some fields there will be a default value,
+If you enter '.', the field will be left blank.
+-----
+Country Name (2 letter code) []:
+State or Province Name (full name) []:
+Locality Name (eg, city) []:
+Organization Name (eg, company) []:
+Organizational Unit Name (eg, section) []:
+Common Name (eg, fully qualified host name) []:test-grpc
+Email Address []:
+
+Please enter the following 'extra' attributes
+to be sent with your certificate request
+A challenge password []:
+```
+
+CSR 是 Cerificate Signing Request 的英文缩写，为证书请求文件。主要作用是 CA 会利用 CSR 文件进行签名使得攻击者无法伪装或篡改原有证书
+
+#### 基于 CA 签发
+
+```
+openssl x509 -req -sha256 -CA ca.pem -CAkey ca.key -CAcreateserial -days 3650 -in server.csr -out server.pem
+```
+
+### Client
+
+### 生成 Key
+
+```
+openssl ecparam -genkey -name secp384r1 -out client.key
+```
+
+### 生成 CSR
+
+```
+openssl req -new -key client.key -out client.csr
+```
+
+填写信息
+
+```go
+You are about to be asked to enter information that will be incorporated
+into your certificate request.
+What you are about to enter is what is called a Distinguished Name or a DN.
+There are quite a few fields but you can leave some blank
+For some fields there will be a default value,
+If you enter '.', the field will be left blank.
+-----
+Country Name (2 letter code) []:
+State or Province Name (full name) []:
+Locality Name (eg, city) []:
+Organization Name (eg, company) []:
+Organizational Unit Name (eg, section) []:
+Common Name (eg, fully qualified host name) []:test-grpc
+Email Address []:
+
+Please enter the following 'extra' attributes
+to be sent with your certificate request
+A challenge password []:
+```
+
+
+
+#### 基于 CA 签发
+
+```
+openssl x509 -req -sha256 -CA ca.pem -CAkey ca.key -CAcreateserial -days 3650 -in client.csr -out client.pem
+```
+
+### 整理目录
+
+至此我们生成了一堆文件，请按照以下目录结构存放：
+
+```
+-> % tree
+.
+├── ca.key
+├── ca.pem
+├── ca.srl
+├── client
+│   ├── client.csr
+│   ├── client.key
+│   └── client.pem
+└── server
+    ├── server.csr
+    ├── server.key
+    └── server.pem
+
+2 directories, 9 files
+```
+
+另外有一些文件是不应该出现在仓库内，应当保密或删除的。
+
+## 服务端代码
+
+```go
+package main
+import (
+	"crypto/tls"
+	"crypto/x509"
+	"fmt"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/metadata"
+	"io"
+	"io/ioutil"
+	"log"
+	"net"
+	"google.golang.org/grpc"
+	pb "grpc/test/src/proto"
+)
+type StreamService struct{}
+
+const PORT = "9002"
+func main() {
+	cert, err := tls.LoadX509KeyPair("/Users/zhangsan/Documents/GitHub/grpc-01/code/conf/server/server.pem", "/Users/zhangsan/Documents/GitHub/grpc-01/code/conf/server/server.key")
+	if err != nil {
+		log.Fatalf("credentials.NewServerTLSFromFile err: %v", err)
+	}
+
+	certPool := x509.NewCertPool()
+	ca, err := ioutil.ReadFile("/Users/zhangsan/Documents/GitHub/grpc-01/code/conf/ca.pem")
+	if err != nil {
+		log.Fatalf("ioutil.ReadFile err: %v", err)
+	}
+	if ok := certPool.AppendCertsFromPEM(ca); !ok {
+		log.Fatalf("certPool.AppendCertsFromPEM err")
+	}
+	c := credentials.NewTLS(&tls.Config{
+		Certificates: []tls.Certificate{cert},
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		ClientCAs:    certPool,
+	})
+
+	server := grpc.NewServer(grpc.Creds(c))
+	pb.RegisterStreamServiceServer(server, &StreamService{})
+	lis, err := net.Listen("tcp", ":"+PORT)
+	if err != nil {
+		log.Fatalf("net.Listen err: %v", err)
+	}
+	server.Serve(lis)
+}
+
+//客户端流rpc
+func (s *StreamService) Work(stream pb.StreamService_WorkServer) error {
+
+	//设置header信息 sendHeader不可同时用，否则SendHeader会覆盖前一个
+	if err := stream.SetHeader(metadata.MD{"cc2":[]string{"dd2"}});nil != err{
+		return err
+	}
+	//设置header信息
+	//if err := stream.SendHeader(metadata.MD{"cc":[]string{"dd"}});err != nil{
+	//	return err
+	//}
+
+
+
+	//设置metadata，注意一元和流式的区别
+	stream.SetTrailer(metadata.MD{"cc1":[]string{"dd1"}})
+
+	a := stream.Context().Value("a")
+	fmt.Println(a)
+	for {
+		r ,err := stream.Recv()
+		if err == io.EOF{
+			return stream.SendAndClose(&pb.PublicResponse{
+				Resp:                &pb.Item{
+					Value:                "client-stream-server",
+					Value2:               "client-stream-server-v2",
+				} ,
+			})
+		}
+		if err != nil{
+			return err
+		}
+		log.Printf("stream.Recv value: %s,value2: %s", r.Req.Value, r.Req.Value2)
+	}
+}
+
+//服务端流式
+func (s *StreamService) Eat(r *pb.PublicRequest, stream pb.StreamService_EatServer) error {
+
+	return nil
+}
+
+func (s *StreamService) Sleep(stream pb.StreamService_SleepServer) error {
+	return nil
+}
+```
+
+
+
+## 客户端代码
+
+```go
+package main
+import (
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"fmt"
+	"io"
+	"io/ioutil"
+	"log"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	pb "grpc/test/src/proto"
+)
+const PORT = "9002"
+func main() {
+	cert, err := tls.LoadX509KeyPair("/Users/zhangsan/Documents/GitHub/grpc-01/code/conf/client/client.pem", "/Users/zhangsan/Documents/GitHub/grpc-01/code/conf/client/client.key")
+	if err != nil {
+		log.Fatalf("tls.LoadX509KeyPair err: %v", err)
+	}
+	certPool := x509.NewCertPool()
+	ca, err := ioutil.ReadFile("/Users/zhangsan/Documents/GitHub/grpc-01/code/conf/ca.pem")
+	if err != nil {
+		log.Fatalf("ioutil.ReadFile err: %v", err)
+	}
+	if ok := certPool.AppendCertsFromPEM(ca); !ok {
+		log.Fatalf("certPool.AppendCertsFromPEM err")
+	}
+	c := credentials.NewTLS(&tls.Config{
+		Certificates: []tls.Certificate{cert},
+		ServerName:   "test-grpc",
+		RootCAs:      certPool,
+	})
+
+
+	conn, err := grpc.Dial(":"+PORT, grpc.WithTransportCredentials(c))
+	if err != nil {
+		log.Fatalf("grpc.Dial err: %v", err)
+	}
+	defer conn.Close()
+	client := pb.NewStreamServiceClient(conn)
+	err = printWork(client, &pb.PublicRequest{
+		Req: &pb.Item{
+			Value:                "valueWork",
+			Value2:               "value1Work",
+
+		},
+	})
+	if err != nil {
+		log.Fatalf("printWork.err: %v", err)
+	}
+}
+
+func printWork(client pb.StreamServiceClient, r *pb.PublicRequest) error {
+	stream,err := client.Work(context.Background())
+	if err != nil{
+		return err
+	}
+
+	for i := 0 ;i < 6;i++{
+		fmt.Println(r)
+		err := stream.Send(r)
+		if err == io.EOF{
+			break
+		}
+		if err != nil{
+			return err
+		}
+	}
+
+	//注意这个header是设置不了的
+	//fmt.Println(stream.Header())
+
+	resp ,err := stream.CloseAndRecv()
+	if err != nil{
+		return err
+	}
+
+	log.Printf("resp: value1 %s, value1 %s",resp.Resp.Value,resp.Resp.Value2)
+
+	//在一元rpc中header和trailer是一起到达的，在流式中是在接受消息后到达的
+	fmt.Println(stream.Trailer())//map[cc1:[dd1]]
+	return nil
+}
+```
+
+验证
+
+```go
+-> % go run src/client/CA-TLS_client/main.go 
+req:<value:"valueWork" value2:"value1Work" > 
+req:<value:"valueWork" value2:"value1Work" > 
+req:<value:"valueWork" value2:"value1Work" > 
+req:<value:"valueWork" value2:"value1Work" > 
+req:<value:"valueWork" value2:"value1Work" > 
+req:<value:"valueWork" value2:"value1Work" > 
+2021/06/02 16:34:22 resp: value1 client-stream-server, value1 client-stream-server-v2
+map[cc1:[dd1]]
+
+-> % go run src/server/CA-TLS_server/main.go             
+<nil>
+2021/06/02 16:34:22 stream.Recv value: valueWork,value2: value1Work
+2021/06/02 16:34:22 stream.Recv value: valueWork,value2: value1Work
+2021/06/02 16:34:22 stream.Recv value: valueWork,value2: value1Work
+2021/06/02 16:34:22 stream.Recv value: valueWork,value2: value1Work
+2021/06/02 16:34:22 stream.Recv value: valueWork,value2: value1Work
+2021/06/02 16:34:22 stream.Recv value: valueWork,value2: value1Work
+```
 
 
 

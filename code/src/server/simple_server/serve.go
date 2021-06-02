@@ -1,11 +1,3 @@
-/**
- * @Author: zhangSan
- * @Description:
- * @File:  serve
- * @Version: 1.0.0
- * @Date: 2021/5/25 上午11:13
- */
-
 package main
 
 import (
