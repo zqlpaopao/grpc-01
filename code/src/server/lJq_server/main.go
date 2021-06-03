@@ -1,21 +1,21 @@
 package main
+
 import (
-	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"github.com/grpc-ecosystem/go-grpc-middleware"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	pb "grpc/test/src/proto"
 	"io"
 	"io/ioutil"
 	"log"
 	"net"
-	"google.golang.org/grpc"
-	pb "grpc/test/src/proto"
 	"runtime/debug"
-	"github.com/grpc-ecosystem/go-grpc-middleware"
 )
 type StreamService struct{}
 
@@ -44,7 +44,7 @@ func main() {
 	opts := []grpc.ServerOption{
 		grpc.Creds(c),
 		grpc_middleware.WithStreamServerChain(
-			//RecoveryInterceptor,
+			RecoveryInterceptor,
 			LoggingInterceptor,
 		),
 	}
@@ -60,7 +60,7 @@ func main() {
 
 //客户端流rpc
 func (s *StreamService) Work(stream pb.StreamService_WorkServer) error {
-
+    panic("panic")
 	//设置header信息 sendHeader不可同时用，否则SendHeader会覆盖前一个
 	if err := stream.SetHeader(metadata.MD{"cc2":[]string{"dd2"}});nil != err{
 		return err
@@ -118,12 +118,12 @@ func LoggingInterceptor(srv interface{}, ss grpc.ServerStream, info *grpc.Stream
 	return err
 }
 
-func RecoveryInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp interface{}, err error) {
+func RecoveryInterceptor(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) (err error) {
 	defer func() {
 		if e := recover(); e != nil {
 			debug.PrintStack()
 			err = status.Errorf(codes.Internal, "Panic err: %v", e)
 		}
 	}()
-	return handler(ctx, req)
+	return handler(srv, ss)
 }

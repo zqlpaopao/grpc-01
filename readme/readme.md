@@ -1753,6 +1753,698 @@ map[cc1:[dd1]]
 
 
 
+# 8、拦截器
+
+在 gRPC 中，大类可分为两种 RPC 方法，与拦截器的对应关系是：
+
+- 普通方法：一元拦截器（grpc.UnaryInterceptor）
+- 流方法：流拦截器（grpc.StreamInterceptor）
+
+
+
+## 一元拦截器
+
+```go
+type UnaryServerInterceptor func(ctx context.Context, req interface{}, info *UnaryServerInfo, handler UnaryHandler) (resp interface{}, err error)
+```
+
+
+
+grpc.UnaryInterceptor
+
+```go
+func UnaryInterceptor(i UnaryServerInterceptor) ServerOption {
+    return func(o *options) {
+        if o.unaryInt != nil {
+            panic("The unary server interceptor was already set and may not be reset.")
+        }
+        o.unaryInt = i
+    }
+}
+```
+
+要完成一个拦截器需要实现 `UnaryServerInterceptor` 方法。形参如下：
+
+- ctx context.Context：请求上下文
+- req interface{}：RPC 方法的请求参数
+- info *UnaryServerInfo：RPC 方法的所有信息
+- handler UnaryHandler：RPC 方法本身
+
+
+
+## 流式拦截器
+
+```go
+type StreamServerInterceptor func(srv interface{}, ss ServerStream, info *StreamServerInfo, handler StreamHandler) error
+```
+
+
+
+### grpc.StreamInterceptor
+
+```go
+ 复制代码func StreamInterceptor(i StreamServerInterceptor) ServerOption
+```
+
+
+
+### 如何实现多个拦截器
+
+另外，可以发现 gRPC 本身居然只能设置一个拦截器，难道所有的逻辑都只能写在一起？
+
+关于这一点，你可以放心。采用开源项目 [go-grpc-middleware](https://github.com/grpc-ecosystem/go-grpc-middleware) 就可以解决这个问题，本章也会使用它。
+
+```
+import "github.com/grpc-ecosystem/go-grpc-middleware"
+myServer := grpc.NewServer(
+    grpc.StreamInterceptor(grpc_middleware.ChainStreamServer(
+        ...
+    )),
+    grpc.UnaryInterceptor(grpc_middleware.ChainUnaryServer(
+       ...
+    )),
+)
+```
+
+
+
+## 流式拦截器代码
+
+```go
+package main
+
+import (
+	"crypto/tls"
+	"crypto/x509"
+	"fmt"
+	"github.com/grpc-ecosystem/go-grpc-middleware"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
+	pb "grpc/test/src/proto"
+	"io"
+	"io/ioutil"
+	"log"
+	"net"
+	"runtime/debug"
+)
+type StreamService struct{}
+
+const PORT = "9002"
+func main() {
+	cert, err := tls.LoadX509KeyPair("/Users/zhangsan/Documents/GitHub/grpc-01/code/conf/server/server.pem", "/Users/zhangsan/Documents/GitHub/grpc-01/code/conf/server/server.key")
+	if err != nil {
+		log.Fatalf("credentials.NewServerTLSFromFile err: %v", err)
+	}
+
+	certPool := x509.NewCertPool()
+	ca, err := ioutil.ReadFile("/Users/zhangsan/Documents/GitHub/grpc-01/code/conf/ca.pem")
+	if err != nil {
+		log.Fatalf("ioutil.ReadFile err: %v", err)
+	}
+	if ok := certPool.AppendCertsFromPEM(ca); !ok {
+		log.Fatalf("certPool.AppendCertsFromPEM err")
+	}
+	c := credentials.NewTLS(&tls.Config{
+		Certificates: []tls.Certificate{cert},
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		ClientCAs:    certPool,
+	})
+
+	//拦截器
+	opts := []grpc.ServerOption{
+		grpc.Creds(c),
+		grpc_middleware.WithStreamServerChain(
+			RecoveryInterceptor,
+			LoggingInterceptor,
+		),
+	}
+
+	server := grpc.NewServer(opts...)
+	pb.RegisterStreamServiceServer(server, &StreamService{})
+	lis, err := net.Listen("tcp", ":"+PORT)
+	if err != nil {
+		log.Fatalf("net.Listen err: %v", err)
+	}
+	server.Serve(lis)
+}
+
+//客户端流rpc
+func (s *StreamService) Work(stream pb.StreamService_WorkServer) error {
+    panic("panic")
+	//设置header信息 sendHeader不可同时用，否则SendHeader会覆盖前一个
+	if err := stream.SetHeader(metadata.MD{"cc2":[]string{"dd2"}});nil != err{
+		return err
+	}
+	//设置header信息
+	//if err := stream.SendHeader(metadata.MD{"cc":[]string{"dd"}});err != nil{
+	//	return err
+	//}
+
+
+
+	//设置metadata，注意一元和流式的区别
+	stream.SetTrailer(metadata.MD{"cc1":[]string{"dd1"}})
+
+	a := stream.Context().Value("a")
+	fmt.Println(a)
+	for {
+		r ,err := stream.Recv()
+		if err == io.EOF{
+			return stream.SendAndClose(&pb.PublicResponse{
+				Resp:                &pb.Item{
+					Value:                "client-stream-server",
+					Value2:               "client-stream-server-v2",
+				} ,
+			})
+		}
+		if err != nil{
+			return err
+		}
+		log.Printf("stream.Recv value: %s,value2: %s", r.Req.Value, r.Req.Value2)
+	}
+}
+
+//服务端流式
+func (s *StreamService) Eat(r *pb.PublicRequest, stream pb.StreamService_EatServer) error {
+
+	return nil
+}
+
+func (s *StreamService) Sleep(stream pb.StreamService_SleepServer) error {
+	return nil
+}
+
+
+//拦截器实现
+func LoggingInterceptor(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+	fmt.Println("srv",srv)
+	fmt.Printf("%#v\n",ss)
+	fmt.Printf("%#v\n",info)
+
+	err := handler(srv,ss)
+	fmt.Println(err)
+
+	return err
+}
+
+func RecoveryInterceptor(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) (err error) {
+	defer func() {
+		if e := recover(); e != nil {
+			debug.PrintStack()
+			err = status.Errorf(codes.Internal, "Panic err: %v", e)
+		}
+	}()
+	return handler(srv, ss)
+}
+```
+
+
+
+验证
+
+```go
+-> % go run src/server/lJq_server/main.go   
+日记的拦截器
+srv &{}
+&grpc.serverStream{ctx:(*context.valueCtx)(0xc0001ba600), t:(*transport.http2Server)(0xc000082c00), s:(*transport.Stream)(0xc0000c0120), p:(*grpc.parser)(0xc00051f1c0), codec:proto.codec{}, cp:grpc.Compressor(nil), dc:grpc.Decompressor(nil), comp:encoding.Compressor(nil), decomp:encoding.Compressor(nil), maxReceiveMessageSize:4194304, maxSendMessageSize:2147483647, trInfo:(*grpc.traceInfo)(nil), statsHandler:stats.Handler(nil), binlog:(*binarylog.MethodLogger)(nil), serverHeaderBinlogged:false, mu:sync.Mutex{state:0, sema:0x0}}
+&grpc.StreamServerInfo{FullMethod:"/proto.StreamService/Work", IsClientStream:true, IsServerStream:false}
+
+panic的拦截器
+goroutine 37 [running]:
+runtime/debug.Stack(0x16, 0x8, 0x0)
+        /usr/local/go/src/runtime/debug/stack.go:24 +0x9d
+runtime/debug.PrintStack()
+        /usr/local/go/src/runtime/debug/stack.go:16 +0x22
+main.RecoveryInterceptor.func1(0xc00052fbf8)
+        /Users/zhangsan/Documents/GitHub/grpc-01/code/src/server/lJq_server/main.go:124 +0x57
+panic(0x1500080, 0x1684460)
+        /usr/local/go/src/runtime/panic.go:969 +0x166
+main.(*StreamService).Work(0x1a80f48, 0x169fa40, 0xc000098870, 0x1698260, 0x1a80f48)
+        /Users/zhangsan/Documents/GitHub/grpc-01/code/src/server/lJq_server/main.go:63 +0x39
+grpc/test/src/proto._StreamService_Work_Handler(0x153ff60, 0x1a80f48, 0x169ce00, 0xc0000f0240, 0xc00052fad0, 0x1)
+        /Users/zhangsan/Documents/GitHub/grpc-01/code/src/proto/stream.pb.go:374 +0xad
+main.LoggingInterceptor(0x153ff60, 0x1a80f48, 0x169ce00, 0xc0000f0240, 0xc00051f1e0, 0x15f9278, 0x20, 0x20)
+        /Users/zhangsan/Documents/GitHub/grpc-01/code/src/server/lJq_server/main.go:115 +0x1f1
+github.com/grpc-ecosystem/go-grpc-middleware.ChainStreamServer.func1.1.1(0x153ff60, 0x1a80f48, 0x169ce00, 0xc0000f0240, 0x3, 0xc00004fc38)
+        /Users/zhangsan/Documents/GitHub/grpc-01/code/vendor/github.com/grpc-ecosystem/go-grpc-middleware/chain.go:49 +0x5f
+main.RecoveryInterceptor(0x153ff60, 0x1a80f48, 0x169ce00, 0xc0000f0240, 0xc00051f1e0, 0xc00051f200, 0x0, 0x0)
+        /Users/zhangsan/Documents/GitHub/grpc-01/code/src/server/lJq_server/main.go:128 +0x8b
+github.com/grpc-ecosystem/go-grpc-middleware.ChainStreamServer.func1.1.1(0x153ff60, 0x1a80f48, 0x169ce00, 0xc0000f0240, 0xc00004fc68, 0x100e788)
+        /Users/zhangsan/Documents/GitHub/grpc-01/code/vendor/github.com/grpc-ecosystem/go-grpc-middleware/chain.go:49 +0x5f
+github.com/grpc-ecosystem/go-grpc-middleware.ChainStreamServer.func1(0x153ff60, 0x1a80f48, 0x169ce00, 0xc0000f0240, 0xc00051f1e0, 0x15f9278, 0x1699e60, 0xc0001ba600)
+        /Users/zhangsan/Documents/GitHub/grpc-01/code/vendor/github.com/grpc-ecosystem/go-grpc-middleware/chain.go:58 +0xcf
+google.golang.org/grpc.(*Server).processStreamingRPC(0xc0001816c0, 0x16a00a0, 0xc000082c00, 0xc0000c0120, 0xc0001bb230, 0x1a4ad20, 0x0, 0x0, 0x0)
+        /Users/zhangsan/Documents/GitHub/grpc-01/code/vendor/google.golang.org/grpc/server.go:1540 +0x511
+google.golang.org/grpc.(*Server).handleStream(0xc0001816c0, 0x16a00a0, 0xc000082c00, 0xc0000c0120, 0x0)
+        /Users/zhangsan/Documents/GitHub/grpc-01/code/vendor/google.golang.org/grpc/server.go:1613 +0xc96
+google.golang.org/grpc.(*Server).serveStreams.func1.2(0xc0000b6400, 0xc0001816c0, 0x16a00a0, 0xc000082c00, 0xc0000c0120)
+        /Users/zhangsan/Documents/GitHub/grpc-01/code/vendor/google.golang.org/grpc/server.go:934 +0xa1
+created by google.golang.org/grpc.(*Server).serveStreams.func1
+        /Users/zhangsan/Documents/GitHub/grpc-01/code/vendor/google.golang.org/grpc/server.go:932 +0x204
+```
+
+
+
+## 一元拦截器代码
+
+```go
+package main
+
+import (
+	"context"
+	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	v11 "grpc/test/src/proto"
+	"log"
+	"net"
+	"os"
+	"runtime/debug"
+)
+
+func main(){
+	RunServer(context.Background(),"9001")
+}
+
+func RunServer(ctx context.Context, port string) error {
+	listen, err := net.Listen("tcp", ":"+port)
+	if nil != err {
+		return err
+	}
+
+	/*
+	var (
+		opts []grpc.ServerOption
+	)
+
+	注册日志，各种时间因素
+	opts = append(opts, gRpcServices.RegisterLogInject(logLayout, constant.GRpcLoginInsKey))
+	opts = append(opts, grpc.KeepaliveParams(keepalive.ServerParameters{
+		MaxConnectionIdle: 15 * time.Second, //client空闲超过该时间，发送一个GOAWAY
+		//MaxConnectionAge:      time.Duration(math.MaxInt64), //client最大存活时间
+		MaxConnectionAge:      5 * time.Second, //client最大存活时间
+		MaxConnectionAgeGrace: 5 * time.Second, //强制关闭连接前缓冲时间，用以完成pending的请求
+		Time:                  5 * time.Second, //client空闲该时间侯，发送一个ping
+		Timeout:               3 * time.Second, //如果ping该时间内未收到pong，认为连接已断开
+	}))
+	opts = append(opts, grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+		MinTime:             3 * time.Second, //client两次ping最小间隔，小于该时间中止连接
+		PermitWithoutStream: true,            //即使没有活动的stream，也允许keepalive的ping
+	}))
+
+	 */
+	//sv = grpc.NewServer(opts...)
+
+	opts := []grpc.ServerOption{
+		grpc_middleware.WithUnaryServerChain(
+			RecoveryInterceptor,
+			LoggingInterceptor,
+		),
+	}
+
+
+	server := grpc.NewServer(opts...)
+	v11.RegisterSayHelloServiceServer(server, NewSayHelloResponseService())
+	c := make(chan os.Signal, 1)
+	go func() {
+		for range c {
+			log.Println("shutting down GRPC server...")
+			server.GracefulStop()//平滑关闭服务
+			<-ctx.Done()
+		}
+	}()
+	log.Println("start gRPC server...,port " + port)
+	return server.Serve(listen)
+
+}
+
+
+type Services struct {
+
+}
+
+func NewSayHelloResponseService()*Services{
+	return &Services{}
+}
+
+
+
+func(s *Services) SayHello(ctx context.Context,req *v11.SayHelloRequest)(resp *v11.SayHelloResponse,err error){
+	return &v11.SayHelloResponse{
+		Response:             "resp",
+	}, err
+}
+
+func LoggingInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+	log.Printf("gRPC method: %s, %v", info.FullMethod, req)
+	resp, err := handler(ctx, req)
+	log.Printf("gRPC method: %s, %v", info.FullMethod, resp)
+	return resp, err
+}
+
+func RecoveryInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp interface{}, err error) {
+	defer func() {
+		if e := recover(); e != nil {
+			debug.PrintStack()
+			err = status.Errorf(codes.Internal, "Panic err: %v", e)
+		}
+	}()
+	return handler(ctx, req)
+}
+```
+
+
+
+验证
+
+```go
+-> % go run src/server/simple_server/serve.go 
+2021/06/03 09:49:00 start gRPC server...,port 9001
+2021/06/03 09:49:10 gRPC method: /proto.SayHelloService/SayHello, request:"gRPC" 
+2021/06/03 09:49:10 gRPC method: /proto.SayHelloService/SayHello, response:"resp" 
+```
+
+
+
+# 9、grpc提供http接口
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/status"
+	v11 "grpc/test/src/proto"
+	"log"
+	"net/http"
+	"os"
+	"runtime/debug"
+	"strings"
+)
+
+func main(){
+	RunServer(context.Background(),"9001")
+}
+
+func RunServer(ctx context.Context, port string) error {
+
+	certFile := "/Users/zhangsan/Documents/GitHub/grpc-01/code/config/server.pem"
+	keyFile := "/Users/zhangsan/Documents/GitHub/grpc-01/code/config/server.key"
+
+	cTls := Tls()
+	opts := []grpc.ServerOption{
+		cTls,
+		grpc_middleware.WithUnaryServerChain(
+			RecoveryInterceptor,
+			LoggingInterceptor,
+		),
+	}
+
+	mux := GetHTTPServeMux()
+
+	server := grpc.NewServer(opts...)
+	v11.RegisterSayHelloServiceServer(server, NewSayHelloResponseService())
+	http.ListenAndServeTLS(":"+port,
+		certFile,
+		keyFile,
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.ProtoMajor == 2 && strings.Contains(r.Header.Get("Content-Type"), "application/grpc") {
+				server.ServeHTTP(w, r)
+			} else {
+				mux.ServeHTTP(w, r)
+			}
+			return
+		}),
+	)
+
+	return nil
+
+}
+func GetHTTPServeMux() *http.ServeMux {
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("testhttp: test-http-grpc"))
+	})
+	return mux
+}
+
+type Services struct {
+
+}
+
+func NewSayHelloResponseService()*Services{
+	return &Services{}
+}
+
+
+
+func(s *Services) SayHello(ctx context.Context,req *v11.SayHelloRequest)(resp *v11.SayHelloResponse,err error){
+	return &v11.SayHelloResponse{
+		Response:             "http resp",
+	}, err
+}
+
+/**************************************** 获取证书 **********************************/
+func Tls()(grpc.ServerOption){
+	c, err := credentials.NewServerTLSFromFile("/Users/zhangsan/Documents/GitHub/grpc-01/code/config/server.pem", "/Users/zhangsan/Documents/GitHub/grpc-01/code/config/server.key")
+	if err != nil {
+		fmt.Println(err)
+		os.Exit(3)
+		return nil
+	}
+	return grpc.Creds(c)
+}
+
+
+
+
+
+/**************************************** 拦截器 **********************************/
+func LoggingInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+	log.Printf("gRPC method: %s, %v", info.FullMethod, req)
+	resp, err := handler(ctx, req)
+	log.Printf("gRPC method: %s, %v", info.FullMethod, resp)
+	return resp, err
+}
+
+func RecoveryInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp interface{}, err error) {
+	defer func() {
+		if e := recover(); e != nil {
+			debug.PrintStack()
+			err = status.Errorf(codes.Internal, "Panic err: %v", e)
+		}
+	}()
+	return handler(ctx, req)
+}
+
+```
+
+
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	v11 "grpc/test/src/proto"
+	"log"
+	"os"
+)
+const PORT = "9001"
+
+func main(){
+
+	c := Tls()
+	conn, err := grpc.Dial(":"+PORT, grpc.WithTransportCredentials(c))
+	if err != nil {
+		log.Fatalf("grpc.Dial err: %v", err)
+	}
+	defer conn.Close()
+
+
+	client := v11.NewSayHelloServiceClient(conn)
+	resp, err := client.SayHello(context.Background(), &v11.SayHelloRequest{
+		Request: "gRPC-http",
+	})
+	if err != nil {
+		log.Fatalf("client.Search err: %v", err)
+	}
+	log.Printf("resp: %s", resp.GetResponse())
+}
+
+
+
+func Tls()(credentials.TransportCredentials){
+
+	c, err := credentials.NewClientTLSFromFile("/Users/zhangsan/Documents/GitHub/grpc-01/code/config/server.pem", "test-http-grpc")
+	if err != nil {
+		fmt.Println(err)
+		os.Exit(3)
+		return nil
+	}
+
+	return c
+}
+```
+
+
+
+验证
+
+```go
+-> % go run src/client/grpc-http_client/main.go                               
+2021/06/03 11:08:06 resp: http resp
+
+```
+
+
+
+http 注意跳过https证书检查
+
+```go
+curl -v -X GET https://127.0.0.1:9001/testhttp 
+* Connection state changed (MAX_CONCURRENT_STREAMS updated)!
+< HTTP/2 200 
+< content-type: text/plain; charset=utf-8
+< content-length: 24
+< date: Thu, 03 Jun 2021 03:25:57 GMT
+< 
+* Connection #0 to host 127.0.0.1 left intact
+testhttp: test-http-grpc%          
+```
+
+![image-20210603113150253](readme.assets/image-20210603113150253.png)
+
+
+
+## 分析
+
+## 为什么可以同时提供 HTTP 接口
+
+关键一点，gRPC 的协议是基于 HTTP/2 的，因此应用程序能够在单个 TCP 端口上提供 HTTP/1.1 和 gRPC 接口服务（两种不同的流量）
+
+## 怎么同时提供 HTTP 接口
+
+### 检测协议
+
+```
+if r.ProtoMajor == 2 && strings.Contains(r.Header.Get("Content-Type"), "application/grpc") {
+    server.ServeHTTP(w, r)
+} else {
+    mux.ServeHTTP(w, r)
+}
+```
+
+### 流程
+
+1. 检测请求协议是否为 HTTP/2
+2. 判断 Content-Type 是否为 application/grpc（gRPC 的默认标识位）
+3. 根据协议的不同转发到不同的服务处理
+
+
+
+- http.NewServeMux：创建一个新的 ServeMux，ServeMux 本质上是一个路由表。它默认实现了 ServeHTTP，因此返回 Handler 后可直接通过 HandleFunc 注册 pattern 和处理逻辑的方法
+- http.ListenAndServeTLS：可简单的理解为提供监听 HTTPS 服务的方法，重点的协议判断转发.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

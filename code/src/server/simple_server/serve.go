@@ -2,11 +2,15 @@ package main
 
 import (
 	"context"
+	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	v11 "grpc/test/src/proto"
 	"log"
 	"net"
 	"os"
+	"runtime/debug"
 )
 
 func main(){
@@ -42,8 +46,15 @@ func RunServer(ctx context.Context, port string) error {
 	 */
 	//sv = grpc.NewServer(opts...)
 
+	opts := []grpc.ServerOption{
+		grpc_middleware.WithUnaryServerChain(
+			RecoveryInterceptor,
+			LoggingInterceptor,
+		),
+	}
 
-	server := grpc.NewServer()
+
+	server := grpc.NewServer(opts...)
 	v11.RegisterSayHelloServiceServer(server, NewSayHelloResponseService())
 	c := make(chan os.Signal, 1)
 	go func() {
@@ -73,6 +84,23 @@ func(s *Services) SayHello(ctx context.Context,req *v11.SayHelloRequest)(resp *v
 	return &v11.SayHelloResponse{
 		Response:             "resp",
 	}, err
+}
+
+func LoggingInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+	log.Printf("gRPC method: %s, %v", info.FullMethod, req)
+	resp, err := handler(ctx, req)
+	log.Printf("gRPC method: %s, %v", info.FullMethod, resp)
+	return resp, err
+}
+
+func RecoveryInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp interface{}, err error) {
+	defer func() {
+		if e := recover(); e != nil {
+			debug.PrintStack()
+			err = status.Errorf(codes.Internal, "Panic err: %v", e)
+		}
+	}()
+	return handler(ctx, req)
 }
 
 
