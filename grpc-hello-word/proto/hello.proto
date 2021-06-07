@@ -20,3 +20,5 @@ message HelloWorldRequest {
 message HelloWorldResponse {
   string message = 1;
 }
+//protoc    --grpc-gateway_out=logtostderr=true:. hello.proto
+
