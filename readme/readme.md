@@ -2361,6 +2361,249 @@ if r.ProtoMajor == 2 && strings.Contains(r.Header.Get("Content-Type"), "applicat
 
 
 
+# 10、RPC方法个性化自定义认证
+
+```go
+type PerRPCCredentials interface {
+    GetRequestMetadata(ctx context.Context, uri ...string) (map[string]string, error)
+    RequireTransportSecurity() bool
+}
+```
+
+
+
+在 gRPC 中默认定义了 PerRPCCredentials，它就是本章节的主角，是 gRPC 默认提供用于自定义认证的接口，它的作用是将所需的安全认证信息添加到每个 RPC 方法的上下文中。其包含 2 个方法：
+
+- GetRequestMetadata：获取当前请求认证所需的元数据（metadata）
+- RequireTransportSecurity：是否需要基于 TLS 认证进行安全传输
+
+## 客户端
+
+```go
+package main
+import (
+	"context"
+	"fmt"
+	"google.golang.org/grpc/credentials"
+	"io"
+	"log"
+	"google.golang.org/grpc"
+	pb "grpc/test/src/proto"
+	v11 "grpc/test/src/proto"
+
+)
+const PORT = "9001"
+
+type Auth struct {
+	AppKey    string
+	AppSecret string
+}
+func (a *Auth) GetRequestMetadata(ctx context.Context, uri ...string) (map[string]string, error) {
+	return map[string]string{"app_key": a.AppKey, "app_secret": a.AppSecret}, nil
+}
+func (a *Auth) RequireTransportSecurity() bool {
+	return true
+}
+
+func main() {
+	c, err := credentials.NewClientTLSFromFile("/Users/zhangsan/Documents/GitHub/grpc-01/code/conf/server/server.pem", "test-grpc")
+	if err != nil {
+		log.Fatalf("credentials.NewClientTLSFromFile err: %v", err)
+	}
+
+	/*
+	/////////////////////////////////////////////////////////
+			认证模块
+	/////////////////////////////////////////////////////////
+	*/
+
+	auth := Auth{
+		AppKey:    "张三1",
+		AppSecret: "2021000",
+	}
+
+	conn, err := grpc.Dial(":"+PORT,grpc.WithTransportCredentials(c),grpc.WithPerRPCCredentials(&auth))
+	if err != nil {
+		log.Fatalf("grpc.Dial err: %v", err)
+	}
+	defer conn.Close()
+
+	client := v11.NewSayHelloServiceClient(conn)
+	resp, err := client.SayHello(context.Background(), &v11.SayHelloRequest{
+		Request: "gRPC",
+	})
+	if err != nil {
+		log.Fatalf("client.Search err: %v", err)
+	}
+	log.Printf("resp: %s", resp.GetResponse())
+
+	resp ,err = client.SayHello(context.Background(),&v11.SayHelloRequest{
+		Request:              "hello",
+
+	})
+	fmt.Println(resp)
+	fmt.Println(err)
+}
+
+func printWork(client pb.StreamServiceClient, r *pb.PublicRequest) error {
+	stream,err := client.Work(context.Background())
+	if err != nil{
+		return err
+	}
+
+	for i := 0 ;i < 6;i++{
+		fmt.Println(r)
+		err := stream.Send(r)
+		if err == io.EOF{
+			break
+		}
+		if err != nil{
+			return err
+		}
+	}
+
+	//注意这个header是设置不了的
+	//fmt.Println(stream.Header())
+
+	resp ,err := stream.CloseAndRecv()
+	if err != nil{
+		return err
+	}
+
+	log.Printf("resp: value1 %s, value1 %s",resp.Resp.Value,resp.Resp.Value2)
+
+	//在一元rpc中header和trailer是一起到达的，在流式中是在接受消息后到达的
+	fmt.Println(stream.Trailer())//map[cc1:[dd1]]
+	return nil
+}
+
+```
+
+
+
+## 服务端
+
+```go
+package main
+
+import (
+	"context"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
+	v11 "grpc/test/src/proto"
+	"log"
+	"net"
+	"os"
+)
+
+const PORT = "9002"
+
+func (a *Auth) Check(ctx context.Context) error {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return status.Errorf(codes.Unauthenticated, "自定义认证 Token 失败")
+	}
+	var (
+		appKey    string
+		appSecret string
+	)
+	if value, ok := md["app_key"]; ok {
+		appKey = value[0]
+	}
+	if value, ok := md["app_secret"]; ok {
+		appSecret = value[0]
+	}
+	if appKey != a.GetAppKey() || appSecret != a.GetAppSecret() {
+		return status.Errorf(codes.Unauthenticated, "自定义认证 Token 无效")
+	}
+	return nil
+}
+func (a *Auth) GetAppKey() string {
+	return "张三"
+}
+func (a *Auth) GetAppSecret() string {
+	return "2021000"
+}
+
+
+func main(){
+	RunServer(context.Background(),"9001")
+}
+
+func RunServer(ctx context.Context, port string) error {
+
+	cs, err := credentials.NewServerTLSFromFile("/Users/zhangsan/Documents/GitHub/grpc-01/code/conf/server/server.pem", "/Users/zhangsan/Documents/GitHub/grpc-01/code/conf/server/server.key")
+	if err != nil {
+		log.Fatalf("credentials.NewServerTLSFromFile err: %v", err)
+	}
+	server := grpc.NewServer(grpc.Creds(cs))
+	listen, err := net.Listen("tcp", ":"+port)
+	if nil != err {
+		return err
+	}
+
+
+	v11.RegisterSayHelloServiceServer(server, NewSayHelloResponseService())
+	c := make(chan os.Signal, 1)
+	go func() {
+		for range c {
+			log.Println("shutting down GRPC server...")
+			server.GracefulStop()//平滑关闭服务
+			<-ctx.Done()
+		}
+	}()
+	log.Println("start gRPC server...,port " + port)
+	return server.Serve(listen)
+
+}
+
+type Auth struct {
+	appKey    string
+	appSecret string
+}
+
+type Services struct {
+	auth *Auth
+}
+
+func NewSayHelloResponseService()*Services{
+	return &Services{}
+}
+
+
+
+func(s *Services) SayHello(ctx context.Context,req *v11.SayHelloRequest)(resp *v11.SayHelloResponse,err error){
+	if err = s.auth.Check(ctx);nil != err{
+		return nil, err
+	}
+	return &v11.SayHelloResponse{
+		Response:             "resp",
+	}, err
+}
+```
+
+
+
+## 验证
+
+```go
+-> % go  run client/preRpc_client/main.go
+2021/06/11 16:37:17 resp: resp
+response:"resp" 
+<nil>
+
+
+-> % go  run client/preRpc_client/main.go
+2021/06/11 16:37:42 client.Search err: rpc error: code = Unauthenticated desc = 自定义认证 Token 无效
+exit status 1
+
+```
+
+如果对多个方法做验证，没必要写多个，我们可以在拦截器中对方法做过滤认证
+
 
 
 

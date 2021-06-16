@@ -1,24 +1,22 @@
 syntax = "proto3";
 
-package proto;
+package hello;
 
 import "google/api/annotations.proto";
 
-service HelloWorld {
-  rpc SayHelloWorld(HelloWorldRequest) returns (HelloWorldResponse) {
+message HelloRequest {
+  string name = 1;
+  int32 age = 2;
+}
+message HelloReply {
+  string message = 1;
+}
+service HelloService {
+  rpc SayHello (HelloRequest) returns (HelloReply){
     option (google.api.http) = {
-      post: "/hello_world"
-      body: "*"
+      post:"/v1/examples/sayhello"
+      body:"*"
     };
   }
 }
-
-message HelloWorldRequest {
-  string referer = 1;
-}
-
-message HelloWorldResponse {
-  string message = 1;
-}
-//protoc    --grpc-gateway_out=logtostderr=true:. hello.proto
 
