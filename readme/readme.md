@@ -2608,17 +2608,277 @@ exit status 1
 
 
 
+# 11、分布式链路追踪
+
+## Opentracing
+
+### 是什么
+
+OpenTracing 通过提供平台无关、厂商无关的API，使得开发人员能够方便的添加（或更换）追踪系统的实现
+
+不过 OpenTracing 并不是标准。因为 CNCF 不是官方标准机构，但是它的目标是致力为分布式追踪创建更标准的 API 和工具
+
+### 名词解释
+
+#### Trace
+
+一个 trace 代表了一个事务或者流程在（分布式）系统中的执行过程
+
+#### Span
+
+一个 span 代表在分布式系统中完成的单个工作单元。也包含其他 span 的 “引用”，这允许将多个 spans 组合成一个完整的 Trace
+
+每个 span 根据 OpenTracing 规范封装以下内容：
+
+- 操作名称
+- 开始时间和结束时间
+- key:value span Tags
+- key:value span Logs
+- SpanContext
+
+#### Tags
+
+Span tags（跨度标签）可以理解为用户自定义的 Span 注释。便于查询、过滤和理解跟踪数据
+
+#### Logs
+
+Span logs（跨度日志）可以记录 Span 内特定时间或事件的日志信息。主要用于捕获特定 Span 的日志信息以及应用程序本身的其他调试或信息输出
+
+#### SpanContext
+
+SpanContext 代表跨越进程边界，传递到子级 Span 的状态。常在追踪示意图中创建上下文时使用
+
+#### Baggage Items
+
+Baggage Items 可以理解为 trace 全局运行中额外传输的数据集合
+
+### 一个案例
+
+![image](readme.assets/5716c802ee32334a716a63c1fb554d01.png)
+
+图中可以看到以下内容：
+
+- 执行时间的上下文
+- 服务间的层次关系
+- 服务间串行或并行调用链
+
+结合以上信息，在实际场景中我们可以通过整个系统的调用链的上下文、性能等指标信息，一下子就能够发现系统的痛点在哪儿
+
+## 安装Zipkin
+
+```go
+docker run -d -p 9411:9411 openzipkin/zipkin
+```
+
+[其他安装方式](https://github.com/openzipkin/zipkin)
+
+![image-20210616101713980](readme.assets/image-20210616101713980.png)
+
+## 代码
+
+```
+$ go get -u github.com/openzipkin-contrib/zipkin-go-opentracing
+$ go get -u github.com/grpc-ecosystem/grpc-opentracing/go/otgrpc
+```
 
 
 
+### 客户端
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"github.com/grpc-ecosystem/grpc-opentracing/go/otgrpc"
+	"github.com/opentracing/opentracing-go"
+	zipkinot "github.com/openzipkin-contrib/zipkin-go-opentracing"
+	"github.com/openzipkin/zipkin-go"
+	zipkinhttp "github.com/openzipkin/zipkin-go/reporter/http"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	v11 "grpc/test/src/proto"
+	"log"
+)
+const (
+	PORT = "9001"
+	SERVICE_NAME              = "simple_zipkin_server"
+	ZIPKIN_HTTP_ENDPOINT      = "http://127.0.0.1:9411/api/v2/spans"
+	ZIPKIN_RECORDER_HOST_PORT = "127.0.0.1:9000"
+)
+
+
+func main() {
+	c, err := credentials.NewClientTLSFromFile("/Users/zhangsan/Documents/GitHub/grpc-01/code/conf/server/server.pem", "test-grpc")
+	if err != nil {
+		log.Fatalf("credentials.NewClientTLSFromFile err: %v", err)
+	}
+
+	//{
+		// set up a span reporter
+		reporter := zipkinhttp.NewReporter(ZIPKIN_HTTP_ENDPOINT)
+		defer reporter.Close()
+
+		// create our local service endpoint
+		endpoint, err := zipkin.NewEndpoint(SERVICE_NAME, ZIPKIN_RECORDER_HOST_PORT)
+		if err != nil {
+			log.Fatalf("unable to create local endpoint: %+v\n", err)
+		}
+
+		// initialize our tracer
+		nativeTracer, err := zipkin.NewTracer(reporter, zipkin.WithLocalEndpoint(endpoint))
+		if err != nil {
+			log.Fatalf("unable to create tracer: %+v\n", err)
+		}
+
+		// use zipkin-go-opentracing to wrap our tracer
+		tracer := zipkinot.Wrap(nativeTracer)
+
+		// optionally set as Global OpenTracing tracer instance
+		opentracing.SetGlobalTracer(tracer)
+	//}
+
+	conn, err := grpc.Dial(":"+PORT,
+		grpc.WithTransportCredentials(c),
+		grpc.WithUnaryInterceptor(
+			otgrpc.OpenTracingClientInterceptor(tracer, otgrpc.LogPayloads()),
+		))
+	if err != nil {
+		log.Fatalf("grpc.Dial err: %v", err)
+	}
+	defer conn.Close()
+
+	client := v11.NewSayHelloServiceClient(conn)
+	resp, err := client.SayHello(context.Background(), &v11.SayHelloRequest{
+		Request: "gRPC",
+	})
+	if err != nil {
+		log.Fatalf("client.Search err: %v", err)
+	}
+	log.Printf("resp: %s", resp.GetResponse())
+
+	resp ,err = client.SayHello(context.Background(),&v11.SayHelloRequest{
+		Request:              "hello",
+
+	})
+	fmt.Println(resp)
+	fmt.Println(err)
+	//os.Exit(3)
+}
+```
 
 
 
+### 服务端
+
+```go
+package main
+
+import (
+	"context"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	v11 "grpc/test/src/proto"
+	zipkinhttp "github.com/openzipkin/zipkin-go/reporter/http"
+	"github.com/opentracing/opentracing-go"
+	"github.com/openzipkin/zipkin-go"
+	zipkinot "github.com/openzipkin-contrib/zipkin-go-opentracing"
+	"log"
+	"net"
+	"os"
+)
+
+const (
+	SERVICE_NAME              = "simple_zipkin_server"
+	ZIPKIN_HTTP_ENDPOINT      = "http://127.0.0.1:9411/api/v2/spans"
+	ZIPKIN_RECORDER_HOST_PORT = "127.0.0.1:9000"
+)
+
+
+func main(){
+	{
+		// set up a span reporter
+		reporter := zipkinhttp.NewReporter(ZIPKIN_HTTP_ENDPOINT)
+		defer reporter.Close()
+
+		// create our local service endpoint
+		endpoint, err := zipkin.NewEndpoint(SERVICE_NAME, ZIPKIN_RECORDER_HOST_PORT)
+		if err != nil {
+			log.Fatalf("unable to create local endpoint: %+v\n", err)
+		}
+
+		// initialize our tracer
+		nativeTracer, err := zipkin.NewTracer(reporter, zipkin.WithLocalEndpoint(endpoint))
+		if err != nil {
+			log.Fatalf("unable to create tracer: %+v\n", err)
+		}
+
+		// use zipkin-go-opentracing to wrap our tracer
+		tracer := zipkinot.Wrap(nativeTracer)
+
+		// optionally set as Global OpenTracing tracer instance
+		opentracing.SetGlobalTracer(tracer)
+	}
+
+	RunServer(context.Background(),"9001")
+}
+
+func RunServer(ctx context.Context, port string) error {
+
+	cs, err := credentials.NewServerTLSFromFile("/Users/zhangsan/Documents/GitHub/grpc-01/code/conf/server/server.pem", "/Users/zhangsan/Documents/GitHub/grpc-01/code/conf/server/server.key")
+	if err != nil {
+		log.Fatalf("credentials.NewServerTLSFromFile err: %v", err)
+	}
+	server := grpc.NewServer(grpc.Creds(cs))
+	listen, err := net.Listen("tcp", ":"+port)
+	if nil != err {
+		return err
+	}
+
+
+	v11.RegisterSayHelloServiceServer(server, NewSayHelloResponseService())
+	c := make(chan os.Signal, 1)
+	go func() {
+		for range c {
+			log.Println("shutting down GRPC server...")
+			server.GracefulStop()//平滑关闭服务
+			<-ctx.Done()
+		}
+	}()
+	log.Println("start gRPC server...,port " + port)
+	return server.Serve(listen)
+
+}
+
+type Auth struct {
+	appKey    string
+	appSecret string
+}
+
+type Services struct {
+}
+
+func NewSayHelloResponseService()*Services{
+	return &Services{}
+}
 
 
 
+func(s *Services) SayHello(ctx context.Context,req *v11.SayHelloRequest)(resp *v11.SayHelloResponse,err error){
+	return &v11.SayHelloResponse{
+		Response:             "resp",
+	}, err
+}
+```
 
 
+
+### 验证
+
+启动客户端、服务端请求，然后 http://127.0.0.1:9411/zipkin/
+
+![image-20210616111018602](readme.assets/image-20210616111018602.png)
 
 
 
