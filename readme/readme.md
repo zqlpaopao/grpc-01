@@ -2882,9 +2882,261 @@ func(s *Services) SayHello(ctx context.Context,req *v11.SayHelloRequest)(resp *v
 
 
 
+# 12、客户端负载均衡
+
+grpc.ClientConn 表示一个客户端实例与服务端之间的连接，主要包含如下数据结构：
+
+##### grpc.connectivityStateManager(grpc.ClientConn.csMgr) 总体的连接状态
+
+状态类型为 connectivity.State，有如下几种状态：
+
+- Idle
+- Connecting
+- Ready
+- TransientFailure
+- Shutdown
+
+grpc.ClientConn 包含了多个 grpc.addrConn（每个 grpc.addrConn 表示客户端到一个服务端的一条连接），每个 grpc.addrConn 也有自己的连接转态。
+
+- 当至少有一个 grpc.addrConn.state = Ready，则 grpc.ClientConn.csMgr.state = Ready
+- 当至少有一个 grpc.addrConn.state = Connecting，则 grpc.ClientConn.csMgr.state = Connecting
+- 否则 grpc.ClientConn.csMgr.state = TransientFailure
+
+> 默认实现下客户端与某一个服务端（host:port）只会建立一条连接，所有 RPC 执行都会复用这条连接。 关于为何只建立一条连接可以看下这个 issue：[Use multiple connections to avoid the server’s SETTINGS_MAX_CONCURRENT_STREAMS limit #11704](https://github.com/grpc/grpc/issues/11704) 不过如果使用 manual.Resolver，把同一个服务地址复制多遍，也能做到与一个服务端建立多个连接。
+
+关于 grpc.addrConn.state 的转态切换可参考设计文档：[gRPC Connectivity Semantics and API](https://github.com/grpc/grpc/blob/master/doc/connectivity-semantics-and-api.md)
+
+##### ![image-20210626101313130](readme.assets/image-20210626101313130.png)
 
 
 
+##### grpc.ccResolverWrapper 服务端地址解析模块的封装
+
+grpc 内置的 resolver.Resolver 有：
+
+- dns.dnsResolver：通过域名解析服务地址
+- manual.Resolver：手动设置服务地址
+- passthrough.passthroughResolver：将 grpc.Dial 参数中的地址作为服务地址，这也是默认的
+
+##### grpc.ccBalancerWrapper 负载均衡模块的封装
+
+grpc 内置的 balancer.Balancer 有：
+
+- grpc.pickfirstBalancer：只使用一个服务地址
+- roundrobin：在多个服务地址中轮转
+- grpclb：使用一个单独的服务提供负载均衡信息（可用的服务地址列表）
+
+可参考设计文档：[Load Balancing in gRPC](https://github.com/grpc/grpc/blob/master/doc/load-balancing.md)
+
+##### 
+
+# 13、健康重试
+
+grpc 客户端的重试策略有2种实现，具体可参考涉及文档：[gRPC Retry Design](https://github.com/grpc/proposal/blob/master/A6-client-retries.md)：
+
+- Retry policy：出错时立即重试
+- Hedging policy：定时发送并发的多个请求，根据请求的响应情况决定是否发送下一个同样的请求，还是返回（该策略目前未实现）
+
+> ==注意：==
+>
+> 客户端程序启动时，还需要设置环境变量：GRPC_GO_RETRY=on
+>
+> MaxAttempts = 2，即最多尝试2次，也就是最多重试1次
+>
+> RetryableStatusCodes 只设置了 UNAVAILABLE，也就是解决上面出现的错误：`rpc error: code = Unavailable desc = transport is closing`
+>
+> RetryableStatusCodes 中设置 DeadlineExceeded 和 Canceled 是没有作用的，因为在重试逻辑的代码里判断到 Context 超时或取消就会立即退出重试逻辑了。
+
+##		客户端代码
+
+
+
+
+```go
+package main
+
+import (
+	"context"
+	"google.golang.org/grpc"
+	v11 "grpc/test/src/proto"
+	"log"
+	_ "google.golang.org/grpc/health"
+	"time"
+)
+const PORT = "9001"
+
+func main(){
+	conn, err := grpc.Dial(":"+PORT, grpc.WithInsecure())
+	if err != nil {
+		log.Fatalf("grpc.Dial err: %v", err)
+	}
+	defer conn.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(1)*time.Second)
+defer cancel()
+	client := v11.NewSayHelloServiceClient(conn)
+	resp, err := client.SayHello(ctx, &v11.SayHelloRequest{
+		Request: "gRPC",
+	})
+	if err != nil {
+		log.Fatalf("client.Search err: %v", err)
+	}
+	log.Printf("resp: %s", resp.GetResponse())
+}
+
+
+
+```
+
+
+
+## 服务端代码
+
+```go
+package main
+
+import (
+	"context"
+	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	v11 "grpc/test/src/proto"
+	"log"
+	"net"
+	"os"
+	"runtime/debug"
+	"google.golang.org/grpc/health/grpc_health_v1"
+	"time"
+)
+var stuckDuration time.Duration
+func main(){
+	RunServer(context.Background(),"9001")
+}
+
+func RunServer(ctx context.Context, port string) error {
+	listen, err := net.Listen("tcp", ":"+port)
+	if nil != err {
+		return err
+	}
+
+	opts := []grpc.ServerOption{
+		grpc_middleware.WithUnaryServerChain(
+			RecoveryInterceptor,
+			LoggingInterceptor,
+		),
+	}
+
+
+	server := grpc.NewServer(opts...)
+	v11.RegisterSayHelloServiceServer(server, NewSayHelloResponseService())
+	grpc_health_v1.RegisterHealthServer(server, &Services{})
+	c := make(chan os.Signal, 1)
+	go func() {
+		for range c {
+			log.Println("shutting down GRPC server...")
+			server.GracefulStop()//平滑关闭服务
+			<-ctx.Done()
+		}
+	}()
+	log.Println("start gRPC server...,port " + port)
+	return server.Serve(listen)
+
+}
+
+
+type Services struct {
+
+}
+
+func NewSayHelloResponseService()*Services{
+	return &Services{}
+}
+
+
+
+func(s *Services) SayHello(ctx context.Context,req *v11.SayHelloRequest)(resp *v11.SayHelloResponse,err error){
+	//time.Sleep(3 *time.Second)
+	return &v11.SayHelloResponse{
+		Response:             "resp",
+	}, err
+}
+
+func (h *Services) Check(ctx context.Context, req *grpc_health_v1.HealthCheckRequest) (*grpc_health_v1.HealthCheckResponse, error) {
+	log.Println("recv health check for service:", req.Service)
+	if stuckDuration == time.Second {
+		return &grpc_health_v1.HealthCheckResponse{Status: grpc_health_v1.HealthCheckResponse_NOT_SERVING}, nil
+	}
+	return &grpc_health_v1.HealthCheckResponse{Status: grpc_health_v1.HealthCheckResponse_SERVING}, nil
+}
+
+func (h *Services) Watch(req *grpc_health_v1.HealthCheckRequest, stream grpc_health_v1.Health_WatchServer) error {
+	log.Println("recv health watch for service:", req.Service)
+	resp := new(grpc_health_v1.HealthCheckResponse)
+	if stuckDuration == time.Second {
+		resp.Status = grpc_health_v1.HealthCheckResponse_NOT_SERVING
+	} else {
+		resp.Status = grpc_health_v1.HealthCheckResponse_SERVING
+	}
+	for range time.NewTicker(time.Second).C {
+		err := stream.Send(resp)
+		if err != nil {
+			return status.Error(codes.Canceled, "Stream has ended.")
+		}
+	}
+	return nil
+}
+
+
+
+
+
+func LoggingInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+	log.Printf("gRPC method: %s, %v", info.FullMethod, req)
+	resp, err := handler(ctx, req)
+	log.Printf("gRPC method: %s, %v", info.FullMethod, resp)
+	return resp, err
+}
+
+func RecoveryInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp interface{}, err error) {
+	defer func() {
+		if e := recover(); e != nil {
+			debug.PrintStack()
+			err = status.Errorf(codes.Internal, "Panic err: %v", e)
+		}
+	}()
+	return handler(ctx, req)
+}
+```
+
+
+
+客户端在超时或者收到unhealthy的回复时可以认为服务端异常。
+
+客户端可以通过调用check方法（需要添加deadline）检查服务端的健康状况，建议servicename为package_names.ServiceName, 例如 grpc.health.v1.Health。watch方法用于流式健康检查，server会立即响应当前的服务状态，当server服务状态发生改变的时候也会发送消息过来。 
+
+
+
+3个服务端实例，只向其中2个发送了请求，通过查看3个服务端日志，确认其中有一个会在健康检查接口中返回 HealthCheckResponse_NOT_SERVING。
+
+
+
+
+
+#### 客户端负载均衡 VS 负载均衡代理
+
+负载均衡代理：
+
+- 好处：客户端实现简单
+- 坏处：增加延迟，增加负载均衡代理的维护成本
+
+客户端负载均衡：
+
+- 好处：低延迟，不需要维护负载均衡代理
+- 坏处：通常只能实现简单的负载均衡策略，但是可以借助 grpclb 实现负载的负载均衡策略
+
+关于负载均衡可以看下 grpc 的分享：[gRPC Load Balancing on Kubernetes - Jan Tattermusch, Google (Intermediate Skill Level)](https://grpc.io/docs/talks/)
+
+本文涉及的代码和 k8s yaml 的仓库：[go-grpc-client-side-lb-example](https://github.com/yangxikun/go-grpc-client-side-lb-example)
 
 
 
