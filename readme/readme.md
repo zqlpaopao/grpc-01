@@ -3286,7 +3286,368 @@ msg: 0
 
 
 
+# proto管理工具 buf
+	
+buf之于proto，类似go mod之于golang，它通过buf.yaml来声明一个proto的module，作为管理的最小单元，方便其它proto库引用，也可以用来声明对其它库的依赖，包括从远程仓库BSR（全称 Buf Schema Registry）拉取依赖的proto库。它同时提供了代码生成管理工具buf.gen.yaml方便我们指定protoc插件，以及对这些protoc插件的安装和管理，我们不用本地配置protoc工具和各种protoc插件，大大提升了开发效率。
 
+​    buf是使用golang编写的，地址位于https://github.com/bufbuild/buf，所以安装方式除了使用brew，也可以使用go install
+
+```
+brew install bufbuild/buf/bufgo install github.com/bufbuild/buf/cmd/buf@v1.15.1
+```
+
+安装完成后检查下版本
+
+```
+buf --version1.15.1
+```
+
+​     官方的BSR地址是https://buf.build/，我们可以https://buf.build/login页面进行注册登录。使用体验类似github
+
+	
+​    buf的使用可以参考官方文档https://docs.buf.build/tutorials/getting-started-with-buf-cli 和https://docs.buf.build/tutorials/getting-started-with-bsr，介绍得非常详尽，buf的核心功能如下，就不一一翻译了：
+
+```
+The ability to manage Protobuf assets on the Buf Schema Registry (BSR).A linter that enforces good API design choices and structure.A breaking change detector that enforces compatibility at the source code or wire level.A generator that invokes your plugins based on configurable templates.A formatter that formats your Protobuf files in accordance with industry standards.Integration with the Buf Schema Registry, including full dependency management.
+```
+
+下面我们就follow官方的文档来学习下buff的使用，首先下载官方的例子
+
+```
+git clone https://github.com/bufbuild/buf-tourcd buf-tour/start/getting-started-with-buf-cli
+```
+
+然后初始化一个module
+
+```
+cd protobuf mod init
+```
+
+可以看到，新生成了一个buf.yaml文件，也就是module的声明文件
+
+```
+version: v1breaking:  use:    - FILElint:  use:    - DEFAULT
+```
+
+我们可以通过buf build命令检查当前module声明的合法性
+
+```
+buf build echo$?0
+```
+
+buf.yaml 所在的位置代表了一个module的根目录，一个module是一系列关系密切的proto的集合。
+
+​    紧接着我们看下如何使用buf.gen.yaml来管理当前项目依赖的protoc插件来生成目标代码。
+
+```
+cd ..touch buf.gen.yaml
+```
+
+比如我们希望依赖protoc-gen-go（https://github.com/protocolbuffers/protobuf-go）插件来生成golang代码，以及connect-go（https://github.com/bufbuild/connect-go）插件来生成grpc，或者http server代码，我们可以这样配置buf.gen.yaml
+
+```
+version: v1managed:  enabled: true  go_package_prefix:    default: github.com/bufbuild/buf-tour/genplugins:  - plugin: buf.build/protocolbuffers/go    out: gen    opt: paths=source_relative  - plugin: buf.build/bufbuild/connect-go    out: gen    opt: paths=source_relative
+```
+
+
+
+
+
+配置完成后，我们就不用关心如何下载，部署和配置插件了，直接运行命令
+
+```
+buf generate proto
+```
+
+就可以完成上述操作，并生成对应的golang代码。
+
+```
+% tree
+.
+|____proto
+| |____buf.yaml
+| |____google
+| | |____type
+| | | |____datetime.proto
+| |____pet
+| | |____v1
+| | | |____pet.proto
+|____gen
+| |____google
+| | |____type
+| | | |____datetime.pb.go
+| |____pet
+| | |____v1
+| | | |____pet.pb.go
+| | | |____petv1connect
+| | | | |____pet.connect.go
+|____buf.gen.yaml
+```
+
+其中gen目录下的代码就是我们新生成的。buf还有一些相关的管理工具，比如lint
+
+- 
+- 
+- 
+- 
+
+```
+ buf lint proto
+ proto/google/type/datetime.proto:17:1:Package name "google.type" should be suffixed with a correctly formed version, such as "google.type.v1".proto/pet/v1/pet.proto:42:10:Field name "petID" should be lower_snake_case, such as "pet_id".proto/pet/v1/pet.proto:47:9:Service name "PetStore" should be suffixed with "Service".
+```
+
+可以看到，我们声明的proto有三个不规范的地方：1，引用的包没有加版本号 2，字段名不是下划线格式 3，服务不是以Service结尾，我们修改下
+
+```
+syntax = "proto3";
+
+package pet.v1;
+
+...
+
+message DeletePetRequest {
+-  string petID = 1;
++  string pet_id = 1;
+}
+
+message DeletePetResponse {}
+
+-service PetStore {
++service PetStoreService {
+  rpc GetPet(GetPetRequest) returns (GetPetResponse) {}
+  rpc PutPet(PutPetRequest) returns (PutPetResponse) {}
+  rpc DeletePet(DeletePetRequest) returns (DeletePetResponse) {}
+}
+```
+
+但是，引用的包google.type是官方的包，我们改不了，我们可以在buf.yaml里将它忽略掉
+
+```
+ version: v1
+ breaking:
+   use:
+     - FILE
+ lint:
+   use:
+     - DEFAULT
++  ignore:
++    - google/type/datetime.proto
+```
+
+重新运行lint命令，我们发现已经通过了，当然，对于现存的proto文件，即使不符合规范，我们也改不了，我们可以通过命令来生成忽略设置配置
+
+```
+% buf lint proto --error-format=config-ignore-yaml
+version: v1
+lint:
+  ignore_only:
+    FIELD_LOWER_SNAKE_CASE:
+      - pet/v1/pet.proto
+    SERVICE_SUFFIX:
+      - pet/v1/pet.proto
+```
+
+下一次，我们就可以依据已经生成的忽略模板文件来忽略掉存量不规范的格式
+
+```
+buf lint --error-format=config-ignore-yaml
+```
+
+如果我们的proto 变更发生了老版本不兼容的问题，我们也可以通过命令来检查
+
+```
+% buf breaking proto --against "../../.git#subdir=start/getting-started-with-buf-cli/proto"
+```
+
+比如我们发生了这样的变更
+
+```
+message Pet {
+-  PetType pet_type = 1;
++  string pet_type = 1;
+  string pet_id = 2;
+  string name = 3;
+}
+```
+
+通过检查不兼容变更就可以得到
+
+```
+% buf breaking proto --against "../../.git#subdir=start/getting-started-with-buf-cli/proto"proto/pet/v1/pet.proto:33:3:Field "1" on message "PutPetRequest" changed type from "enum" to "string".
+```
+
+生成golang代码后 buf还提供了curl工具来进行测试。
+
+```
+go mod init github.com/bufbuild/buf-tour
+go: creating new go.mod: module github.com/bufbuild/buf-tour
+go: to add module requirements and sums:
+        go mod tidy
+```
+
+```
+mkdir servertouch server/main.go
+go mod tidy
+```
+
+其中main.go文件如下
+
+```
+package main
+
+import (
+    "context"
+    "fmt"
+    "log"
+    "net/http"
+    petv1 "github.com/bufbuild/buf-tour/gen/pet/v1"
+  petv1connect  "github.com/bufbuild/buf-tour/gen/pet/v1/petv1connect"
+    "github.com/bufbuild/connect-go"
+    "golang.org/x/net/http2"
+    "golang.org/x/net/http2/h2c"
+)
+
+const address = "localhost:8080"
+
+func main() {
+    mux := http.NewServeMux()
+    path, handler := petv1connect.NewPetStoreServiceHandler(&petStoreServiceServer{})
+    mux.Handle(path, handler)
+    fmt.Println("... Listening on", address)
+    http.ListenAndServe(
+        address,
+        // Use h2c so we can serve HTTP/2 without TLS.
+        h2c.NewHandler(mux, &http2.Server{}),
+    )
+}
+
+// petStoreServiceServer implements the PetStoreService API.
+type petStoreServiceServer struct {
+    petv1connect.UnimplementedPetStoreServiceHandler
+}
+
+// PutPet adds the pet associated with the given request into the PetStore.
+func (s *petStoreServiceServer) PutPet(
+    ctx context.Context,
+    req *connect.Request[petv1.PutPetRequest],
+) (*connect.Response[petv1.PutPetResponse], error) {
+    name := req.Msg.GetName()
+    petType := req.Msg.GetPetType()
+    log.Printf("Got a request to create a %v named %s", petType, name)
+    return connect.NewResponse(&petv1.PutPetResponse{}), nil
+}
+```
+
+启动服务
+
+```
+ go run ./server   ... Listening on localhost:8080
+```
+
+然后我们就可以发起请求了
+
+```
+buf curl \
+--schema proto/pet/v1/pet.proto \
+--data '{"pet_type": "PET_TYPE_SNAKE", "name": "Ekans"}' \
+http://localhost:8080/pet.v1.PetStoreService/PutPet
+```
+
+接着，我们体验下使用buf schema registry
+
+```
+cd buf-tour/start/getting-started-with-bsr
+```
+
+注册bsr账号，创建repository，然后把buf.yaml里的包名声明成如下格式
+
+```
+version: v1
+  + name: buf.build/<USER>/petapis
+    breaking:
+      use:
+        - FILE
+    lint:
+      use:
+        - DEFAULT
+```
+
+改动完毕后，我们可以加buf.md说明文件，然后运行
+
+```
+buf push
+```
+
+推送到远程。当然，我们也可以通过deps声明依赖的远程proto文件
+
+```
+version: v1
+ name: buf.build/<USER>/petapis
+ +deps:
+ +  - buf.build/googleapis/googleapis
+ breaking:
+   use:
+     - FILE
+ lint:
+   use:
+     - DEFAULT
+```
+
+然后通过buf mod update命令来下载依赖，并且生成lock文件buf.lock
+
+```
+buf mod update
+```
+
+生成的lock文件内容如下
+
+```
+# Generated by buf. DO NOT EDIT.
+version: v1
+deps:
+  - remote: buf.build
+    owner: googleapis
+    repository: googleapis
+    commit: 62f35d8aed1149c291d606d958a7ce32
+```
+
+默认情况下，会将所有的proto文件生成对应的go代码，但是对于googleapis/googleapis这样的官方proto文件，github上会有官方维护的package，我应该使用官方的包，而不是自己重新生成一遍，我们可以在buf.gen.yaml里面添加except指令来进行排除，
+
+```
+ except: +      - buf.build/googleapis/googleapis
+```
+
+完整的变动如下，这样我们就可以直接使用官方生成的go package
+
+```
+version: v1
+ managed:
+   enabled: true
+   go_package_prefix:
+     default: github.com/bufbuild/buf-tour/petstore/gen
+ +    except:
+ +      - buf.build/googleapis/googleapis
+ plugins:
+ -  - plugin: buf.build/protocolbuffers/go
+ -    out: gen
+ -    opt: paths=source_relative
+   - plugin: buf.build/bufbuild/connect-go
+     out: gen
+     opt: paths=source_relative
+```
+
+相应的，本地就不会生成官方的proto对应的golang代码
+
+```
+gen
+└── pet
+    └── v1
+        ├── pet.pb.go
+        └── petv1connect
+            └── pet.connect.go
+```
+
+至此，buf的核心功能介绍完毕，感兴趣的同学可以去学习下官网的wiki，非常详尽。
 
 
 
