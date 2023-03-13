@@ -3154,7 +3154,134 @@ func RecoveryInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryS
 
 
 
+# 自定义proto插件
+[read](https://mp.weixin.qq.com/s/kS2EJt1V6kStm8CgprslCg)
+在使用protoc的时候，可以通过指定不同的插件来生成不同的代码，它的参数统一是xx_out结尾的，制定了插件参数，就会到path下搜索protoc-gen-xx的插件。比如 protoc 通过 --foo_out 搜索插件 可执行文件 protoc-gen-foo， 也可使用参数 protoc --plugin=protoc-gen-foo=/path/to/protoc-gen-foo 指定插件位置。
 
+        protoc插件是一个独立的二进制程序，protoc进程通过fork生成子进程，并exec加载插件程序运行。父子进程间通过管道通信，并将管道的输入和输出重定向到标准输入和标准输出。
+
+      protoc进程将proto文件的信息封装为CodeGeneratorRequest传递给插件子进程，插件子进程将根据CodeGeneratorRequest中的信息，将要生成的代码数据封装为CodeGeneratorResponse对象传递给protoc进程。
+
+    插件进程从标准输入读取出CodeGeneratorRequest数据，将CodeGeneratorResponse数据写到标准输出。CodeGeneratorRequest和CodeGeneratorRequest两者也是使用proto定义的。于是一个protoc插件的开发可以简单分为三步：
+
+从标准输入读取解析出CodeGeneratorRequest数据
+利用读取的数据来生成对应的代码
+将生成的结果封装为CodeGeneratorResponse写入标准输出
+       编写protoc插件的模板代码如下：
+```
+package main
+import (
+  "flag"
+  "fmt"
+
+  "google.golang.org/protobuf/compiler/protogen"
+)
+func main() {
+  // 用于接收命令行参数
+  var (
+    flags        flag.FlagSet
+    plugins      = flags.String("plugins", "", "list of plugins to enable (supported values: grpc)")
+    importPrefix = flags.String("import_prefix", "", "prefix to prepend to import paths")
+  )
+  importRewriteFunc := func(importPath protogen.GoImportPath) protogen.GoImportPath {
+    switch importPath {
+    case "context", "fmt", "math":
+      return importPath
+    }
+    if *importPrefix != "" {
+      return protogen.GoImportPath(*importPrefix) + importPath
+    }
+    return importPath
+  }
+  protogen.Options{
+    ParamFunc:         flags.Set,
+    ImportRewriteFunc: importRewriteFunc,
+  }.Run(func(gen *protogen.Plugin) error {
+    // ...
+    for _, f := range gen.Files {
+      // 根据proto文件信息来生成新文件
+      fmt.Println(plugins, f)
+    }
+    return nil
+  })
+}
+```
+其中
+```
+protogen.Options{
+    ParamFunc:         flags.Set,
+    ImportRewriteFunc: importRewriteFunc,
+  }
+```
+
+Options有两个字段：
+
+ParamFunc：命令行中的插件参数会以--go_out=<param1>=<value1>,<param2>=<value2>:<output_directory>的形式输入并最总被解析为CodeGeneratorRequest字段，Run方法运行过程中会读取出键值对并调用ParamFunc函数，这样就可以将命令行参数绑定到flags对应的变量中了。
+ImportRewriteFunc：生成的新文件中的每个包导入的路径可以使用此函数进行重写
+        然后调用Run方法来进行相关代码的生成。下面我们实现一个简单的插件，实现解析消息体的字段名，并写文件。
+
+```
+package main
+
+import (
+  "strconv"
+  "strings"
+
+  "google.golang.org/protobuf/compiler/protogen"
+)
+
+func main() {
+  protogen.Options{}.Run(func(p *protogen.Plugin) error {
+    // 遍历proto文件
+    for _, f := range p.Files {
+      fname := f.GeneratedFilenamePrefix + ".txt"
+      // 后续使用t来写入新文件
+      t := p.NewGeneratedFile(fname, f.GoImportPath)
+
+      for _, msg := range f.Messages {
+        builder := strings.Builder{}
+        for _, field := range msg.Fields {
+          builder.WriteString(field.Desc.TextName() + ": " + strconv.Itoa(field.Desc.Index()) + "\n")
+        }
+        t.Write([]byte(builder.String()))
+      }
+    }
+    return nil
+  })
+}
+```
+
+可以定义一个文件来测试下
+```
+syntax = "proto3";
+
+package api;
+
+option go_package = "api/v1;v1";
+
+message HelloRequest {
+    string msg = 1;
+}
+
+```
+
+```
+export PATH=$GOPATH/bin:$PATH
+go build -o protoc-gen-test main.go
+cp protoc-gen-test $GOPATH/bin
+chmod +X $GOPATH/bin/proto-gen-test
+```
+
+然后就可以使用我们自定义的插件了
+```
+protoc --test_out=. test.proto
+```
+
+可以看到，生成了文件test.txt,内容是
+```
+msg: 0
+```
+至此一个简单的protoc插件开发完毕。
 
 
 
