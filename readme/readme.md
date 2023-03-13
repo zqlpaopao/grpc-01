@@ -3287,6 +3287,7 @@ msg: 0
 
 
 # proto管理工具 buf
+[read](https://mp.weixin.qq.com/s/L5haiVS8QLEtUrhfDKur3w)
 	
 buf之于proto，类似go mod之于golang，它通过buf.yaml来声明一个proto的module，作为管理的最小单元，方便其它proto库引用，也可以用来声明对其它库的依赖，包括从远程仓库BSR（全称 Buf Schema Registry）拉取依赖的proto库。它同时提供了代码生成管理工具buf.gen.yaml方便我们指定protoc插件，以及对这些protoc插件的安装和管理，我们不用本地配置protoc工具和各种protoc插件，大大提升了开发效率。
 
