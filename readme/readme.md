@@ -339,6 +339,32 @@ more information, such as the ld(1) and ld.so(8) manual pages.
 
 而我们安装了一个新的动态链接库，`ldconfig`一般在系统启动时运行，所以现在会找不到这个`lib`，因此我们要手动执行`ldconfig`，**让动态链接库为系统所共享，它是一个动态链接库管理命令**，这就是`ldconfig`命令的作用
 
+**问题二**
+```
+o: module github.com/golang/protobuf is deprecated: Use the "google.golang.org/protobuf" module instead.
+go get: installing executables with 'go get' in module mode is deprecated.
+        Use 'go install pkg@version' instead.
+        For more information, see https://golang.org/doc/go-get-install-deprecation
+        or run 'go help get' or 'go help install'.
+```
+报了两个错误
+
+现在想要拉取protoc-gen-go需要去google.golang.org/protobuf拉取，原来的路径已经废弃了。
+我使用的go版本是1.17。而Go1.17版使用go install安装依赖。所以应该按照它下面的格式go install pkg@version进行拉取。
+
+切换拉取路径
+```
+go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
+```
+
+```
+whereis protoc-gen-go                                                                  
+protoc-gen-go: /Users/zhangqiuli24/go/bin/protoc-gen-go
+```
+
+然后在mv
+
+
 ### protoc使用
 
 我们按照惯例执行`protoc --help`（查看帮助文档），我们抽出几个常用的命令进行讲解
