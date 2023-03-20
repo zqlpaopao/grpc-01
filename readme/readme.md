@@ -446,7 +446,7 @@ Please specify a program using absolute path or make sure the program is availab
 
 protoc --go-grpc_out=plugins=grpc:.  ./huawei-arp.proto
 
-protoc --go-grpc_out=.  ./huawei-arp.proto
+protoc --go_out=. --go_opt=paths=source_relative  --go-grpc_out=. --go-grpc_opt=paths=source_relative huawei-arp.proto
 
 ```
 [参考](https://grpc.io/docs/languages/go/quickstart/#regenerate-grpc-code)
