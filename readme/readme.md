@@ -364,6 +364,93 @@ protoc-gen-go: /Users/zhangqiuli24/go/bin/protoc-gen-go
 
 然后在mv
 
+**问题三**
+```
+protoc --go_out=plugins=grpc:.  ./huawei-aaa.proto
+protoc-gen-go: unable to determine Go import path for "huawei-aaa.proto"
+
+Please specify either:
+	• a "go_package" option in the .proto source file, or
+	• a "M" argument on the command line.
+
+See https://protobuf.dev/reference/go/go-generated#package for more information.
+
+--go_out: protoc-gen-go: Plugin failed with status code 1.
+```
+
+源文件
+```
+syntax = "proto3";
+
+package ipc;
+
+// 长连接Token验证请求
+message GameAuthReq {
+    string authToken = 1;   // Token
+    string serverId = 2;    // 登录服务器ID
+}
+
+...
+```
+
+编译命令为：
+```
+protoc --go_out=. proto/ipc.proto
+```
+
+原因是protoc-gen-go版本过高，对源proto文件需要添加包名。在proto文件中添加option go_package = "/ipc";就可以解决了。
+
+```
+syntax = "proto3";
+
+package ipc;
+option go_package = "/ipc";
+
+// 长连接Token验证请求
+message GameAuthReq {
+    string authToken = 1;   // Token
+    string serverId = 2;    // 登录服务器ID
+}
+
+...
+```
+
+还有一种解决办法就是把protoc-gen-go版本退回到1.3.2及以下也可以解决。
+
+
+***问题四*
+
+```
+
+protoc --go_out=plugins=grpc:.  ./huawei-arp.proto
+--go_out: protoc-gen-go: plugins are not supported; use 'protoc --go-grpc_out=...' to generate gRPC
+
+See https://grpc.io/docs/languages/go/quickstart/#regenerate-grpc-code for more information.
+```
+
+换成
+```
+protoc --go-grpc_out=plugins=grpc:.  ./huawei-arp.proto
+```
+
+问题五
+```
+protoc --go-grpc_out=plugins=grpc:.  ./huawei-arp.proto
+protoc-gen-go-grpc: program not found or is not executable
+Please specify a program using absolute path or make sure the program is available in your PATH system variable
+--go-grpc_out: protoc-gen-go-grpc: Plugin failed with status code 1.
+```
+
+切换命令
+```
+
+protoc --go-grpc_out=plugins=grpc:.  ./huawei-arp.proto
+
+protoc --go-grpc_out=.  ./huawei-arp.proto
+
+```
+[参考](https://grpc.io/docs/languages/go/quickstart/#regenerate-grpc-code)
+
 
 ### protoc使用
 
